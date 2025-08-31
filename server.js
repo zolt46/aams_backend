@@ -289,18 +289,124 @@ app.delete('/api/firearms/:id', async (req, res) => {
 
 
 
+// ===== Ammunition API =====
+
+// 목록 조회
 app.get('/api/ammunition', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT ammo_name, ammo_category, quantity, storage_locker, status, last_change, notes
+    const q = `
+      SELECT
+        id, ammo_name, ammo_category, quantity, storage_locker,
+        status, last_change, notes
       FROM ammunition
-    `);
-    res.json(result.rows);
+      ORDER BY id DESC
+    `;
+    const { rows } = await pool.query(q);
+    res.json(rows);
   } catch (err) {
     console.error('Error fetching ammunition data:', err);
     res.status(500).json({ error: 'Failed to fetch ammunition data' });
   }
 });
+
+// 단건 조회(선택)
+app.get('/api/ammunition/:id', async (req, res) => {
+  try {
+    const q = `
+      SELECT
+        id, ammo_name, ammo_category, quantity, storage_locker,
+        status, last_change, notes
+      FROM ammunition
+      WHERE id=$1
+    `;
+    const { rows } = await pool.query(q, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error fetching ammunition item:', err);
+    res.status(500).json({ error: 'Failed to fetch item' });
+  }
+});
+
+// 추가
+app.post('/api/ammunition', async (req, res) => {
+  const { ammo_name, ammo_category, quantity, storage_locker, status, notes } = req.body;
+
+  const required = { ammo_name, ammo_category, quantity, storage_locker, status };
+  for (const [k, v] of Object.entries(required)) {
+    if (v === undefined || v === null || String(v).trim?.() === '') {
+      return res.status(400).json({ error: `missing field: ${k}` });
+    }
+  }
+  const qnum = Number(quantity);
+  if (!Number.isInteger(qnum) || qnum < 0) {
+    return res.status(400).json({ error: 'quantity must be a non-negative integer' });
+  }
+
+  try {
+    const q = `
+      INSERT INTO ammunition
+        (ammo_name, ammo_category, quantity, storage_locker, status, notes)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING id
+    `;
+    const { rows } = await pool.query(q, [
+      ammo_name, ammo_category, qnum, storage_locker, status, notes ?? null
+    ]);
+    res.json({ id: rows[0].id });
+  } catch (err) {
+    console.error('Error inserting ammunition:', err);
+    res.status(500).json({ error: 'insert failed' });
+  }
+});
+
+// 수정
+app.put('/api/ammunition/:id', async (req, res) => {
+  const id = req.params.id;
+  const { ammo_name, ammo_category, quantity, storage_locker, status, notes } = req.body;
+
+  const required = { ammo_name, ammo_category, quantity, storage_locker, status };
+  for (const [k, v] of Object.entries(required)) {
+    if (v === undefined || v === null || String(v).trim?.() === '') {
+      return res.status(400).json({ error: `missing field: ${k}` });
+    }
+  }
+  const qnum = Number(quantity);
+  if (!Number.isInteger(qnum) || qnum < 0) {
+    return res.status(400).json({ error: 'quantity must be a non-negative integer' });
+  }
+
+  try {
+    const q = `
+      UPDATE ammunition SET
+        ammo_name=$1, ammo_category=$2, quantity=$3,
+        storage_locker=$4, status=$5, notes=$6, last_change=CURRENT_TIMESTAMP
+      WHERE id=$7
+      RETURNING id
+    `;
+    const { rows } = await pool.query(q, [
+      ammo_name, ammo_category, qnum, storage_locker, status, notes ?? null, id
+    ]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ id: rows[0].id });
+  } catch (err) {
+    console.error('Error updating ammunition:', err);
+    res.status(500).json({ error: 'update failed' });
+  }
+});
+
+// 삭제
+app.delete('/api/ammunition/:id', async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM ammunition WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error deleting ammunition:', err);
+    res.status(500).json({ error: 'delete failed' });
+  }
+});
+
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
