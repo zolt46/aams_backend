@@ -150,18 +150,18 @@ app.delete('/api/personnel/:id', async (req, res) => {
 
 // ===== Firearms API =====
 
-// 목록 조회 (프론트는 JOIN 결과를 그대로 표에 표시)
+// 목록 조회 (JOIN: 프론트가 owner_* 그대로 사용)
 app.get('/api/firearms', async (req, res) => {
   try {
     const q = `
       SELECT
         f.id,
         f.owner_id,
-        p.name  AS owner_name,
-        p.rank  AS owner_rank,
-        p.military_id AS owner_military_id,
-        p.unit  AS owner_unit,
-        p.position AS owner_position,
+        p.name         AS owner_name,
+        p.rank         AS owner_rank,
+        p.military_id  AS owner_military_id,
+        p.unit         AS owner_unit,
+        p.position     AS owner_position,
         f.firearm_type,
         f.firearm_number,
         f.storage_locker,
@@ -180,7 +180,7 @@ app.get('/api/firearms', async (req, res) => {
   }
 });
 
-// 단건 조회(선택사항)
+// 단건 조회(선택)
 app.get('/api/firearms/:id', async (req, res) => {
   try {
     const q = `
@@ -202,7 +202,7 @@ app.get('/api/firearms/:id', async (req, res) => {
   }
 });
 
-// 추가 (총기번호 UNIQUE 가정)
+// 추가 (firearm_number UNIQUE)
 app.post('/api/firearms', async (req, res) => {
   const { owner_id, firearm_type, firearm_number, storage_locker, status, notes } = req.body;
 
@@ -278,6 +278,7 @@ app.delete('/api/firearms/:id', async (req, res) => {
     res.status(500).json({ error: 'delete failed' });
   }
 });
+
 
 
 app.get('/api/ammunition', async (req, res) => {
