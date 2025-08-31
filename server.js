@@ -148,16 +148,19 @@ app.delete('/api/personnel/:id', async (req, res) => {
   }
 });
 
-// ====================== Firearms / Ammunition (기존 유지) ======================
+// ===== Firearms API =====
 
+// 목록 조회 (프론트는 JOIN 결과를 그대로 표에 표시)
 app.get('/api/firearms', async (req, res) => {
   try {
-    const query = `
-      SELECT 
-        p.name AS owner_name,
-        p.rank AS owner_rank,
+    const q = `
+      SELECT
+        f.id,
+        f.owner_id,
+        p.name  AS owner_name,
+        p.rank  AS owner_rank,
         p.military_id AS owner_military_id,
-        p.unit AS owner_unit,
+        p.unit  AS owner_unit,
         p.position AS owner_position,
         f.firearm_type,
         f.firearm_number,
@@ -167,14 +170,115 @@ app.get('/api/firearms', async (req, res) => {
         f.notes
       FROM firearms f
       LEFT JOIN personnel p ON f.owner_id = p.id
+      ORDER BY f.id DESC
     `;
-    const result = await pool.query(query);
-    res.json(result.rows);
+    const { rows } = await pool.query(q);
+    res.json(rows);
   } catch (err) {
     console.error('Error fetching firearms data:', err);
     res.status(500).json({ error: 'Failed to fetch firearms data' });
   }
 });
+
+// 단건 조회(선택사항)
+app.get('/api/firearms/:id', async (req, res) => {
+  try {
+    const q = `
+      SELECT
+        f.id, f.owner_id,
+        p.name AS owner_name, p.rank AS owner_rank, p.military_id AS owner_military_id,
+        p.unit AS owner_unit, p.position AS owner_position,
+        f.firearm_type, f.firearm_number, f.storage_locker, f.status, f.last_change, f.notes
+      FROM firearms f
+      LEFT JOIN personnel p ON f.owner_id = p.id
+      WHERE f.id=$1
+    `;
+    const { rows } = await pool.query(q, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error fetching firearm item:', err);
+    res.status(500).json({ error: 'Failed to fetch item' });
+  }
+});
+
+// 추가 (총기번호 UNIQUE 가정)
+app.post('/api/firearms', async (req, res) => {
+  const { owner_id, firearm_type, firearm_number, storage_locker, status, notes } = req.body;
+
+  const required = { owner_id, firearm_type, firearm_number, storage_locker, status };
+  for (const [k, v] of Object.entries(required)) {
+    if (v === undefined || v === null || String(v).trim() === '') {
+      return res.status(400).json({ error: `missing field: ${k}` });
+    }
+  }
+
+  try {
+    const q = `
+      INSERT INTO firearms
+        (owner_id, firearm_type, firearm_number, storage_locker, status, notes)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING id
+    `;
+    const { rows } = await pool.query(q, [
+      owner_id, firearm_type, firearm_number, storage_locker, status, notes ?? null
+    ]);
+    res.json({ id: rows[0].id });
+  } catch (err) {
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'duplicate key (firearm_number)' });
+    }
+    console.error('Error inserting firearm:', err);
+    res.status(500).json({ error: 'insert failed' });
+  }
+});
+
+// 수정
+app.put('/api/firearms/:id', async (req, res) => {
+  const id = req.params.id;
+  const { owner_id, firearm_type, firearm_number, storage_locker, status, notes } = req.body;
+
+  const required = { owner_id, firearm_type, firearm_number, storage_locker, status };
+  for (const [k, v] of Object.entries(required)) {
+    if (v === undefined || v === null || String(v).trim() === '') {
+      return res.status(400).json({ error: `missing field: ${k}` });
+    }
+  }
+
+  try {
+    const q = `
+      UPDATE firearms SET
+        owner_id=$1, firearm_type=$2, firearm_number=$3, storage_locker=$4,
+        status=$5, notes=$6, last_change=CURRENT_TIMESTAMP
+      WHERE id=$7
+      RETURNING id
+    `;
+    const { rows } = await pool.query(q, [
+      owner_id, firearm_type, firearm_number, storage_locker, status, notes ?? null, id
+    ]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ id: rows[0].id });
+  } catch (err) {
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'duplicate key (firearm_number)' });
+    }
+    console.error('Error updating firearm:', err);
+    res.status(500).json({ error: 'update failed' });
+  }
+});
+
+// 삭제
+app.delete('/api/firearms/:id', async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM firearms WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error deleting firearm:', err);
+    res.status(500).json({ error: 'delete failed' });
+  }
+});
+
 
 app.get('/api/ammunition', async (req, res) => {
   try {
