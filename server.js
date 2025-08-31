@@ -9,32 +9,27 @@ const port = process.env.PORT || 3000;
 // CORS 설정: 모든 도메인에서의 요청을 허용
 app.use(cors());
 
+// ⬇⬇ 추가: 프론트에서 보내는 JSON 바디를 파싱 (POST/PUT에 필수)
+app.use(express.json());
+
 // 데이터베이스 연결 설정
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false
-    }
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
+// 헬스체크
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// API 엔드포인트: 인원(personnel) 현황
+// ====================== Personnel API ======================
+
+// 목록 조회 (프론트가 사용 중)
 app.get('/api/personnel', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        id,
-        name,
-        rank,
-        military_id,
-        unit,
-        position,
-        user_id,
-        is_admin,
-        contact,
-        last_modified,
-        notes
+        id, name, rank, military_id, unit, position,
+        user_id, is_admin, contact, last_modified, notes
       FROM personnel
       ORDER BY id DESC
     `);
@@ -45,45 +40,155 @@ app.get('/api/personnel', async (req, res) => {
   }
 });
 
-
-// API 엔드포인트: 총기 현황
-app.get('/api/firearms', async (req, res) => {
-    try {
-        const query = `
-            SELECT 
-                p.name AS owner_name,
-                p.rank AS owner_rank,
-                p.military_id AS owner_military_id,
-                p.unit AS owner_unit,
-                p.position AS owner_position,
-                f.firearm_type,
-                f.firearm_number,
-                f.storage_locker,
-                f.status,
-                f.last_change,
-                f.notes
-            FROM firearms f
-            LEFT JOIN personnel p ON f.owner_id = p.id
-        `;
-        const result = await pool.query(query);
-        res.json(result.rows);
-    } catch (err) {
-        console.error('Error fetching firearms data:', err);
-        res.status(500).json({ error: 'Failed to fetch firearms data' });
-    }
+// ⬇⬇ 추가: 단건 조회(선택사항, 디버깅/확인용)
+app.get('/api/personnel/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, rank, military_id, unit, position,
+              user_id, is_admin, contact, last_modified, notes
+       FROM personnel WHERE id=$1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error fetching personnel item:', err);
+    res.status(500).json({ error: 'Failed to fetch item' });
+  }
 });
 
-// API 엔드포인트: 탄약 현황
-app.get('/api/ammunition', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT ammo_name, ammo_category, quantity, storage_locker, status, last_change, notes FROM ammunition');
-        res.json(result.rows);
-    } catch (err) {
-        console.error('Error fetching ammunition data:', err);
-        res.status(500).json({ error: 'Failed to fetch ammunition data' });
+// ⬇⬇ 추가: 신규 추가 (프론트의 “추가 → 저장”)
+app.post('/api/personnel', async (req, res) => {
+  const {
+    name, rank, military_id, unit, position,
+    user_id, password_hash, is_admin, contact, notes
+  } = req.body;
+
+  // 간단 검증 (필수값)
+  const required = { name, rank, military_id, unit, position, user_id, password_hash };
+  for (const [k, v] of Object.entries(required)) {
+    if (v === undefined || v === null || String(v).trim() === '') {
+      return res.status(400).json({ error: `missing field: ${k}` });
     }
+  }
+
+  try {
+    const q = `
+      INSERT INTO personnel
+        (name, rank, military_id, unit, position, user_id,
+         password_hash, is_admin, contact, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      RETURNING id, name, rank, military_id, unit, position,
+                user_id, is_admin, contact, last_modified, notes`;
+    const { rows } = await pool.query(q, [
+      name, rank, military_id, unit, position, user_id,
+      password_hash, !!is_admin, contact ?? null, notes ?? null
+    ]);
+    res.json(rows[0]);
+  } catch (err) {
+    // UNIQUE 제약 위반 처리 (23505)
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'duplicate key (military_id or user_id)' });
+    }
+    console.error('Error inserting personnel:', err);
+    res.status(500).json({ error: 'insert failed' });
+  }
+});
+
+// ⬇⬇ 추가: 수정 (프론트의 “수정 → 저장”)
+app.put('/api/personnel/:id', async (req, res) => {
+  const id = req.params.id;
+  const {
+    name, rank, military_id, unit, position,
+    user_id, password_hash, is_admin, contact, notes
+  } = req.body;
+
+  // 간단 검증
+  const required = { name, rank, military_id, unit, position, user_id };
+  for (const [k, v] of Object.entries(required)) {
+    if (v === undefined || v === null || String(v).trim() === '') {
+      return res.status(400).json({ error: `missing field: ${k}` });
+    }
+  }
+
+  try {
+    const q = `
+      UPDATE personnel SET
+        name=$1, rank=$2, military_id=$3, unit=$4, position=$5,
+        user_id=$6, password_hash=$7, is_admin=$8, contact=$9, notes=$10,
+        last_modified=CURRENT_TIMESTAMP
+      WHERE id=$11
+      RETURNING id, name, rank, military_id, unit, position,
+                user_id, is_admin, contact, last_modified, notes`;
+    const { rows } = await pool.query(q, [
+      name, rank, military_id, unit, position,
+      user_id, password_hash ?? '', !!is_admin, contact ?? null, notes ?? null,
+      id
+    ]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'duplicate key (military_id or user_id)' });
+    }
+    console.error('Error updating personnel:', err);
+    res.status(500).json({ error: 'update failed' });
+  }
+});
+
+// ⬇⬇ 추가: 삭제 (프론트의 “삭제” - 선택 n건을 개별 호출)
+app.delete('/api/personnel/:id', async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM personnel WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error deleting personnel:', err);
+    res.status(500).json({ error: 'delete failed' });
+  }
+});
+
+// ====================== Firearms / Ammunition (기존 유지) ======================
+
+app.get('/api/firearms', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        p.name AS owner_name,
+        p.rank AS owner_rank,
+        p.military_id AS owner_military_id,
+        p.unit AS owner_unit,
+        p.position AS owner_position,
+        f.firearm_type,
+        f.firearm_number,
+        f.storage_locker,
+        f.status,
+        f.last_change,
+        f.notes
+      FROM firearms f
+      LEFT JOIN personnel p ON f.owner_id = p.id
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching firearms data:', err);
+    res.status(500).json({ error: 'Failed to fetch firearms data' });
+  }
+});
+
+app.get('/api/ammunition', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT ammo_name, ammo_category, quantity, storage_locker, status, last_change, notes
+      FROM ammunition
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching ammunition data:', err);
+    res.status(500).json({ error: 'Failed to fetch ammunition data' });
+  }
 });
 
 app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+  console.log(`Server is running on port ${port}`);
 });
