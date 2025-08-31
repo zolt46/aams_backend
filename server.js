@@ -17,6 +17,8 @@ const pool = new Pool({
     }
 });
 
+app.get('/health', (req, res) => res.json({ ok: true }));
+
 // API 엔드포인트: 인원(personnel) 현황
 app.get('/api/personnel', async (req, res) => {
   try {
