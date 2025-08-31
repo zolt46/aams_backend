@@ -143,10 +143,18 @@ app.delete('/api/personnel/:id', async (req, res) => {
     if (!rowCount) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
   } catch (err) {
+    // 🔴 FK 위반: firearms.owner_id가 이 personnel.id를 참조하면 삭제 불가
+    if (err && err.code === '23503') {
+      return res.status(409).json({
+        error: 'conflict_foreign_key',
+        message: '해당 인원에게 배정된 총기가 있어 삭제할 수 없습니다. 총기 배정을 해제(재배정/삭제)한 뒤 다시 시도하세요.'
+      });
+    }
     console.error('Error deleting personnel:', err);
     res.status(500).json({ error: 'delete failed' });
   }
 });
+
 
 // ===== Firearms API =====
 
@@ -268,21 +276,13 @@ app.put('/api/firearms/:id', async (req, res) => {
 });
 
 // 삭제
-// ⬇⬇ 추가: 삭제 (프론트의 “삭제” - 선택 n건을 개별 호출)
-app.delete('/api/personnel/:id', async (req, res) => {
+app.delete('/api/firearms/:id', async (req, res) => {
   try {
-    const { rowCount } = await pool.query('DELETE FROM personnel WHERE id=$1', [req.params.id]);
+    const { rowCount } = await pool.query('DELETE FROM firearms WHERE id=$1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
   } catch (err) {
-    // 🔴 FK 위반: firearms.owner_id가 이 personnel.id를 참조하면 삭제 불가
-    if (err && err.code === '23503') {
-      return res.status(409).json({
-        error: 'conflict_foreign_key',
-        message: '해당 인원에게 배정된 총기가 있어 삭제할 수 없습니다. 총기 배정을 해제(재배정/삭제)한 뒤 다시 시도하세요.'
-      });
-    }
-    console.error('Error deleting personnel:', err);
+    console.error('Error deleting firearm:', err);
     res.status(500).json({ error: 'delete failed' });
   }
 });
