@@ -21,6 +21,47 @@ const pool = new Pool({
 // 헬스체크
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// === Login API (임시-평문비교) ===
+app.post('/api/login', async (req, res) => {
+  try {
+    const { user_id, password } = req.body || {};
+    if (!user_id || !password) {
+      return res.status(400).json({ error: 'missing user_id or password' });
+    }
+
+    const q = `
+      SELECT id, name, user_id, password_hash, is_admin, rank, unit, position
+      FROM personnel
+      WHERE user_id = $1
+      LIMIT 1
+    `;
+    const { rows } = await pool.query(q, [user_id]);
+    if (!rows.length) return res.status(401).json({ error: 'invalid credentials' });
+
+    const u = rows[0];
+
+    // ⚠️ 임시: 평문 비교 (최종 배포 전 해시 검증으로 교체)
+    if (String(u.password_hash) !== String(password)) {
+      return res.status(401).json({ error: 'invalid credentials' });
+    }
+
+    // 필요한 최소 정보만 프론트에 전달
+    return res.json({
+      id: u.id,
+      name: u.name,
+      user_id: u.user_id,
+      is_admin: u.is_admin,
+      rank: u.rank,
+      unit: u.unit,
+      position: u.position,
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'login failed' });
+  }
+});
+
+
 // ====================== Personnel API ======================
 
 // 목록 조회 (프론트가 사용 중)
