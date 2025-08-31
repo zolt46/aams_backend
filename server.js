@@ -17,16 +17,32 @@ const pool = new Pool({
     }
 });
 
-// API 엔드포인트: 인원 현황
+// API 엔드포인트: 인원(personnel) 현황
 app.get('/api/personnel', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT name, rank, military_id, unit, position, user_id, is_admin, contact, last_modified, notes FROM personnel');
-        res.json(result.rows);
-    } catch (err) {
-        console.error('Error fetching personnel data:', err);
-        res.status(500).json({ error: 'Failed to fetch personnel data' });
-    }
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        name,
+        rank,
+        military_id,
+        unit,
+        position,
+        user_id,
+        is_admin,
+        contact,
+        last_modified,
+        notes
+      FROM personnel
+      ORDER BY id DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching personnel data:', err);
+    res.status(500).json({ error: 'Failed to fetch personnel data' });
+  }
 });
+
 
 // API 엔드포인트: 총기 현황
 app.get('/api/firearms', async (req, res) => {
