@@ -449,165 +449,183 @@ app.delete('/api/ammunition/:id', async (req, res) => {
 });
 
 
-/* ===== AAMS Workcenter API (patch) ===== */
-// utils
-async function withTx(run){
-  const client = await pool.connect();
-  try{
-    await client.query('BEGIN');
-    const r = await run(client);
-    await client.query('COMMIT');
-    return r;
-  }catch(e){
-    await client.query('ROLLBACK'); throw e;
-  }finally{ client.release(); }
-}
+  /* ===========================================
+  * 워크센터 API (신청/승인/집행/로그)
+  * =========================================== */
 
-// 1) Create request
-app.post('/api/requests', async (req,res)=>{
-  try{
-    const { requester_id, request_type, purpose, location, scheduled_at, notes, items=[] } = req.body;
-    const r = await pool.query(
-      `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at,notes)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [requester_id, request_type, purpose, location, scheduled_at, notes]
-    );
-    const reqId = r.rows[0].id;
-    for(const it of items){
-      if(it.type==='FIREARM'){
-        const q = await pool.query(`SELECT id FROM firearms WHERE firearm_number=$1`, [it.ident]);
-        if(!q.rowCount) continue;
-        await pool.query(
-          `INSERT INTO request_items(request_id,item_type,firearm_id) VALUES($1,'FIREARM',$2)`,
-          [reqId, q.rows[0].id]
-        );
-      }else if(it.type==='AMMO'){
-        const q = await pool.query(`SELECT id, ammo_category FROM ammunition WHERE ammo_name=$1`, [it.ident]);
-        if(!q.rowCount) continue;
-        await pool.query(
-          `INSERT INTO request_items(request_id,item_type,ammo_id,quantity,ammo_category) VALUES($1,'AMMO',$2,$3,$4)`,
-          [reqId, q.rows[0].id, it.qty||0, q.rows[0].ammo_category]
-        );
-      }
+  // 트랜잭션 헬퍼
+  async function withTx(run){
+    const client = await pool.connect();
+    try{
+      await client.query('BEGIN');
+      const result = await run(client);
+      await client.query('COMMIT');
+      return result;
+    }catch(e){
+      await client.query('ROLLBACK');
+      throw e;
+    }finally{
+      client.release();
     }
-    res.json({ ok:true, id:reqId });
-  }catch(e){ console.error(e); res.status(500).json({error:'create failed'}); }
-});
+  }
 
-// 2) List requests
-app.get('/api/requests', async (req,res)=>{
-  try{
-    const { status, type } = req.query;
-    let sql = `SELECT r.*, p.name AS requester_name FROM requests r
-               LEFT JOIN personnel p ON p.id=r.requester_id WHERE 1=1`;
-    const args=[];
-    if(status){ args.push(status); sql+=` AND r.status = $${args.length}`; }
-    if(type){ args.push(type); sql+=` AND r.request_type = $${args.length}`; }
-    sql += ` ORDER BY r.id DESC LIMIT 200`;
-    const rows = (await pool.query(sql, args)).rows;
-    res.json(rows);
-  }catch(e){ console.error(e); res.status(500).json({error:'list failed'}); }
-});
+  // 1) 신청 생성
+  app.post('/api/requests', async (req,res)=>{
+    try{
+      const { requester_id, request_type, purpose, location, scheduled_at, notes, items=[] } = req.body;
 
-// 3) Get request detail
-app.get('/api/requests/:id', async (req,res)=>{
-  try{
-    const { rows } = await pool.query(`SELECT * FROM requests WHERE id=$1`, [req.params.id]);
-    if(!rows.length) return res.status(404).json({error:'not found'});
-    const items = (await pool.query(`SELECT * FROM request_items WHERE request_id=$1`, [req.params.id])).rows;
-    res.json({ ...rows[0], items });
-  }catch(e){ console.error(e); res.status(500).json({error:'detail failed'}); }
-});
-
-// 4) Approve / Reject
-app.post('/api/requests/:id/approve', async (req,res)=>{
-  try{
-    const approver_id = req.body?.approver_id || 1; // TODO: replace with real auth
-    await withTx(async(client)=>{
-      await client.query(`INSERT INTO approvals(request_id, approver_id, decision) VALUES($1,$2,'APPROVE')`, [req.params.id, approver_id]);
-      await client.query(`UPDATE requests SET status='APPROVED', updated_at=now() WHERE id=$1`, [req.params.id]);
-    });
-    res.json({ok:true});
-  }catch(e){ console.error(e); res.status(500).json({error:'approve failed'}); }
-});
-
-app.post('/api/requests/:id/reject', async (req,res)=>{
-  try{
-    const { reason, approver_id } = req.body||{};
-    await withTx(async(client)=>{
-      await client.query(`INSERT INTO approvals(request_id, approver_id, decision, reason) VALUES($1,$2,'REJECT',$3)`, [req.params.id, approver_id||1, reason||null]);
-      await client.query(`UPDATE requests SET status='REJECTED', updated_at=now() WHERE id=$1`, [req.params.id]);
-    });
-    res.json({ok:true});
-  }catch(e){ console.error(e); res.status(500).json({error:'reject failed'}); }
-});
-
-// 5) Execute (DISPATCH/RETURN)
-app.post('/api/requests/:id/execute', async (req,res)=>{
-  try{
-    const { event_type='DISPATCH', executed_by } = req.body||{};
-    const exec_by = executed_by || 1; // TODO: replace with real auth
-    const reqId = req.params.id;
-    await withTx(async(client)=>{
-      // precheck: request approved
-      const r = await client.query(`SELECT status FROM requests WHERE id=$1`, [reqId]);
-      if(!r.rowCount || r.rows[0].status!=='APPROVED') throw new Error('not approved');
-
-      const exec = await client.query(`INSERT INTO execution_events(request_id,executed_by,event_type) VALUES($1,$2,$3) RETURNING id, executed_at`, [reqId, exec_by, event_type]);
-      const execId = exec.rows[0].id;
-
-      const items = (await client.query(`SELECT * FROM request_items WHERE request_id=$1`, [reqId])).rows;
+      const r = await pool.query(
+        `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at,notes)
+        VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [requester_id, request_type, purpose, location, scheduled_at, notes]
+      );
+      const reqId = r.rows[0].id;
 
       for(const it of items){
-        if(it.item_type==='FIREARM'){
-          // lock row
-          const cur = await client.query(`SELECT id,status,firearm_number FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
-          if(!cur.rowCount) throw new Error('firearm not found');
-          const from = cur.rows[0].status;
-          const to = (event_type==='DISPATCH') ? '불출' : '보관';
-          if(event_type==='DISPATCH' && from==='불출') throw new Error('already dispatched');
-          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
-            [execId, it.firearm_id, from, to]);
-          await client.query(`UPDATE firearms SET status=$1, last_change=now() WHERE id=$2`, [to, it.firearm_id]);
-        }else{
-          const cur = await client.query(`SELECT id,quantity,ammo_name FROM ammunition WHERE id=$1 FOR UPDATE`, [it.ammo_id]);
-          if(!cur.rowCount) throw new Error('ammo not found');
-          const before = cur.rows[0].quantity;
-          const delta = (event_type==='DISPATCH') ? -(it.quantity||0) : +(it.quantity||0);
-          const after = before + delta;
-          if(after<0) throw new Error('insufficient ammo');
-          await client.query(`INSERT INTO ammo_movements(execution_id,ammo_id,delta,before_qty,after_qty) VALUES($1,$2,$3,$4,$5)`,
-            [execId, it.ammo_id, delta, before, after]);
-          await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`, [after, it.ammo_id]);
+        if(it.type==='FIREARM'){
+          const q = await pool.query(`SELECT id FROM firearms WHERE firearm_number=$1`, [it.ident]);
+          if(!q.rowCount) continue;
+          await pool.query(
+            `INSERT INTO request_items(request_id,item_type,firearm_id) VALUES($1,'FIREARM',$2)`,
+            [reqId, q.rows[0].id]
+          );
+        } else if(it.type==='AMMO'){
+          const q = await pool.query(`SELECT id, ammo_category FROM ammunition WHERE ammo_name=$1`, [it.ident]);
+          if(!q.rowCount) continue;
+          await pool.query(
+            `INSERT INTO request_items(request_id,item_type,ammo_id,quantity,ammo_category) VALUES($1,'AMMO',$2,$3,$4)`,
+            [reqId, q.rows[0].id, it.qty||0, q.rows[0].ammo_category]
+          );
         }
       }
-      await client.query(`UPDATE requests SET status='EXECUTED', updated_at=now() WHERE id=$1`, [reqId]);
-    });
-    res.json({ok:true});
-  }catch(e){ console.error(e); res.status(400).json({error:'execute failed', detail:String(e)}); }
-});
+      res.json({ ok:true, id:reqId });
+    }catch(e){ console.error(e); res.status(500).json({error:'create failed'}); }
+  });
 
-// 6) Execution summaries (for logs view)
-app.get('/api/executions', async (req,res)=>{
-  try{
-    const et = req.query.event_type || null;
-    const base = `SELECT v.*, 
-        COALESCE(json_agg(DISTINCT jsonb_build_object('firearm_id',fsc.firearm_id,'from_status',fsc.from_status,'to_status',fsc.to_status,'firearm_number',fr.firearm_number)) FILTER (WHERE fsc.id IS NOT NULL), '[]') AS firearm_changes,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('ammo_id',am.ammo_id,'delta',am.delta,'before_qty',am.before_qty,'after_qty',am.after_qty,'ammo_name',a.ammo_name)) FILTER (WHERE am.id IS NOT NULL), '[]') AS ammo_moves
-      FROM v_execution_summary v
-      LEFT JOIN firearm_status_changes fsc ON fsc.execution_id=v.execution_id
-      LEFT JOIN firearms fr ON fr.id=fsc.firearm_id
-      LEFT JOIN ammo_movements am ON am.execution_id=v.execution_id
-      LEFT JOIN ammunition a ON a.id=am.ammo_id
-      WHERE ($1::text IS NULL OR v.event_type=$1)
-      GROUP BY v.execution_id, v.event_type, v.executed_at, v.executed_by, v.executed_by_name, v.request_id, v.notes
-      ORDER BY v.executed_at DESC
-      LIMIT 200`;
-    const rows=(await pool.query(base, [et])).rows;
-    res.json(rows);
-  }catch(e){ console.error(e); res.status(500).json({error:'exec list failed'}); }
-});
-/* ===== End patch ===== */
+  // 2) 신청 목록
+  app.get('/api/requests', async (req,res)=>{
+    try{
+      const { status, type } = req.query;
+      let sql = `SELECT r.*, p.name AS requester_name
+                FROM requests r LEFT JOIN personnel p ON p.id=r.requester_id
+                WHERE 1=1`;
+      const args=[];
+      if(status){ args.push(status); sql += ` AND r.status=$${args.length}`; }
+      if(type){   args.push(type);   sql += ` AND r.request_type=$${args.length}`; }
+      sql += ` ORDER BY r.id DESC LIMIT 400`;
+      const { rows } = await pool.query(sql, args);
+      res.json(rows);
+    }catch(e){ console.error(e); res.status(500).json({error:'list failed'}); }
+  });
+
+  // 3) 신청 상세 (라인 포함)
+  app.get('/api/requests/:id', async (req,res)=>{
+    try{
+      const { rows } = await pool.query(`SELECT * FROM requests WHERE id=$1`, [req.params.id]);
+      if(!rows.length) return res.status(404).json({error:'not found'});
+      const items = (await pool.query(`SELECT * FROM request_items WHERE request_id=$1`, [req.params.id])).rows;
+      res.json({ ...rows[0], items });
+    }catch(e){ console.error(e); res.status(500).json({error:'detail failed'}); }
+  });
+
+  // 4) 승인/거부
+  app.post('/api/requests/:id/approve', async (req,res)=>{
+    try{
+      const approver_id = req.body?.approver_id || 1; // 실제 인증 연동 시 토큰에서 추출
+      await withTx(async(client)=>{
+        await client.query(`INSERT INTO approvals(request_id, approver_id, decision) VALUES($1,$2,'APPROVE')`, [req.params.id, approver_id]);
+        await client.query(`UPDATE requests SET status='APPROVED', updated_at=now() WHERE id=$1`, [req.params.id]);
+      });
+      res.json({ok:true});
+    }catch(e){ console.error(e); res.status(500).json({error:'approve failed'}); }
+  });
+
+  app.post('/api/requests/:id/reject', async (req,res)=>{
+    try{
+      const { reason, approver_id } = req.body||{};
+      await withTx(async(client)=>{
+        await client.query(`INSERT INTO approvals(request_id, approver_id, decision, reason) VALUES($1,$2,'REJECT',$3)`, [req.params.id, approver_id||1, reason||null]);
+        await client.query(`UPDATE requests SET status='REJECTED', updated_at=now() WHERE id=$1`, [req.params.id]);
+      });
+      res.json({ok:true});
+    }catch(e){ console.error(e); res.status(500).json({error:'reject failed'}); }
+  });
+
+  // 5) 집행(요청유형 기반으로 자동 DISPATCH/RETURN)
+  app.post('/api/requests/:id/execute', async (req,res)=>{
+    try{
+      const { executed_by } = req.body||{};
+      const exec_by = executed_by || 1; // 실제 인증 연동 시 토큰에서 추출
+      const reqId = req.params.id;
+
+      await withTx(async(client)=>{
+        const r = await client.query(`SELECT status, request_type FROM requests WHERE id=$1 FOR UPDATE`, [reqId]);
+        if(!r.rowCount) throw new Error('request not found');
+        if(r.rows[0].status!=='APPROVED') throw new Error('not approved');
+        const event_type = (r.rows[0].request_type === 'RETURN') ? 'RETURN' : 'DISPATCH';
+
+        const exec = await client.query(
+          `INSERT INTO execution_events(request_id,executed_by,event_type) VALUES($1,$2,$3) RETURNING id,executed_at`,
+          [reqId, exec_by, event_type]
+        );
+        const execId = exec.rows[0].id;
+
+        const items = (await client.query(`SELECT * FROM request_items WHERE request_id=$1`, [reqId])).rows;
+
+        for(const it of items){
+          if(it.item_type==='FIREARM'){
+            const cur = await client.query(`SELECT id,status,firearm_number FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
+            if(!cur.rowCount) throw new Error('firearm not found');
+            const from = cur.rows[0].status;
+            const to = (event_type==='DISPATCH') ? '불출' : '보관';
+            if(event_type==='DISPATCH' && from==='불출') throw new Error('already dispatched');
+            await client.query(
+              `INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
+              [execId, it.firearm_id, from, to]
+            );
+            await client.query(`UPDATE firearms SET status=$1, last_change=now() WHERE id=$2`, [to, it.firearm_id]);
+          } else if(it.item_type==='AMMO'){
+            const cur = await client.query(`SELECT id,quantity,ammo_name FROM ammunition WHERE id=$1 FOR UPDATE`, [it.ammo_id]);
+            if(!cur.rowCount) throw new Error('ammo not found');
+            const before = cur.rows[0].quantity;
+            const delta  = (event_type==='DISPATCH') ? -(it.quantity||0) : +(it.quantity||0);
+            const after  = before + delta;
+            if(after<0) throw new Error('insufficient ammo');
+            await client.query(
+              `INSERT INTO ammo_movements(execution_id,ammo_id,delta,before_qty,after_qty) VALUES($1,$2,$3,$4,$5)`,
+              [execId, it.ammo_id, delta, before, after]
+            );
+            await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`, [after, it.ammo_id]);
+          }
+        }
+        await client.query(`UPDATE requests SET status='EXECUTED', updated_at=now() WHERE id=$1`, [reqId]);
+      });
+
+      res.json({ok:true});
+    }catch(e){ console.error(e); res.status(400).json({error:'execute failed', detail:String(e)}); }
+  });
+
+  // 6) 집행 로그 (총기/탄약 변화까지 집계)
+  app.get('/api/executions', async (req,res)=>{
+    try{
+      const et = req.query.event_type || null;
+      const sql = `
+        SELECT v.*,
+          COALESCE(json_agg(DISTINCT jsonb_build_object('firearm_id',fsc.firearm_id,'from_status',fsc.from_status,'to_status',fsc.to_status,'firearm_number',fr.firearm_number)) FILTER (WHERE fsc.id IS NOT NULL), '[]') AS firearm_changes,
+          COALESCE(json_agg(DISTINCT jsonb_build_object('ammo_id',am.ammo_id,'delta',am.delta,'before_qty',am.before_qty,'after_qty',am.after_qty,'ammo_name',a.ammo_name)) FILTER (WHERE am.id IS NOT NULL), '[]') AS ammo_moves
+        FROM v_execution_summary v
+        LEFT JOIN firearm_status_changes fsc ON fsc.execution_id=v.execution_id
+        LEFT JOIN firearms fr ON fr.id=fsc.firearm_id
+        LEFT JOIN ammo_movements am ON am.execution_id=v.execution_id
+        LEFT JOIN ammunition a ON a.id=am.ammo_id
+        WHERE ($1::text IS NULL OR v.event_type=$1)
+        GROUP BY v.execution_id, v.event_type, v.executed_at, v.executed_by, v.executed_by_name, v.request_id, v.notes
+        ORDER BY v.executed_at DESC
+        LIMIT 400`;
+      const { rows } = await pool.query(sql, [et]);
+      res.json(rows);
+    }catch(e){ console.error(e); res.status(500).json({error:'exec list failed'}); }
+  });
 
 
 
