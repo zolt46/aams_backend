@@ -200,9 +200,12 @@ app.delete('/api/personnel/:id', async (req, res) => {
 // ===== Firearms API =====
 
 // 목록 조회 (JOIN: 프론트가 owner_* 그대로 사용)
+// ===== Firearms API (검색/가용 필터 지원) =====
 app.get('/api/firearms', async (req, res) => {
   try {
-    const q = `
+    const { q, status, limit, availableOnly } = req.query;
+    const args = [];
+    let sql = `
       SELECT
         f.id,
         f.owner_id,
@@ -219,9 +222,21 @@ app.get('/api/firearms', async (req, res) => {
         f.notes
       FROM firearms f
       LEFT JOIN personnel p ON f.owner_id = p.id
-      ORDER BY f.id DESC
+      WHERE 1=1
     `;
-    const { rows } = await pool.query(q);
+    if (status) { args.push(status); sql += ` AND f.status = $${args.length}`; }
+    if (q) {
+      args.push(`%${q}%`); sql += ` AND (f.firearm_number ILIKE $${args.length}`;
+      args.push(`%${q}%`); sql += ` OR f.firearm_type  ILIKE $${args.length})`;
+    }
+    if (availableOnly === 'true') {
+      // 프로젝트 용어에 맞게: '불출'이 아닌 것만 가용
+      args.push('불출'); sql += ` AND f.status <> $${args.length}`;
+    }
+    sql += ` ORDER BY f.id DESC`;
+    if (limit) { args.push(Number(limit) || 50); sql += ` LIMIT $${args.length}`; }
+
+    const { rows } = await pool.query(sql, args);
     res.json(rows);
   } catch (err) {
     console.error('Error fetching firearms data:', err);
@@ -333,16 +348,26 @@ app.delete('/api/firearms/:id', async (req, res) => {
 // ===== Ammunition API =====
 
 // 목록 조회
+// ===== Ammunition API (검색 지원) =====
 app.get('/api/ammunition', async (req, res) => {
   try {
-    const q = `
+    const { q, status, limit } = req.query;
+    const args = [];
+    let sql = `
       SELECT
         id, ammo_name, ammo_category, quantity, storage_locker,
         status, last_change, notes
       FROM ammunition
-      ORDER BY id DESC
+      WHERE 1=1
     `;
-    const { rows } = await pool.query(q);
+    if (status) { args.push(status); sql += ` AND status = $${args.length}`; }
+    if (q) {
+      args.push(`%${q}%`); sql += ` AND (ammo_name ILIKE $${args.length}`;
+      args.push(`%${q}%`); sql += ` OR ammo_category ILIKE $${args.length})`;
+    }
+    sql += ` ORDER BY id DESC`;
+    if (limit) { args.push(Number(limit) || 50); sql += ` LIMIT $${args.length}`; }
+    const { rows } = await pool.query(sql, args);
     res.json(rows);
   } catch (err) {
     console.error('Error fetching ammunition data:', err);
@@ -470,37 +495,48 @@ app.delete('/api/ammunition/:id', async (req, res) => {
   }
 
   // 1) 신청 생성
-  app.post('/api/requests', async (req,res)=>{
-    try{
-      const { requester_id, request_type, purpose, location, scheduled_at, notes, items=[] } = req.body;
+app.post('/api/requests', async (req,res)=>{
+  try{
+    const { requester_id, request_type, purpose, location, scheduled_at, notes, items=[] } = req.body;
 
-      const r = await pool.query(
-        `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at,notes)
-        VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [requester_id, request_type, purpose, location, scheduled_at, notes]
-      );
-      const reqId = r.rows[0].id;
+    const r = await pool.query(
+      `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at,notes)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [requester_id, request_type, purpose, location, scheduled_at, notes]
+    );
+    const reqId = r.rows[0].id;
 
-      for(const it of items){
-        if(it.type==='FIREARM'){
-          const q = await pool.query(`SELECT id FROM firearms WHERE firearm_number=$1`, [it.ident]);
-          if(!q.rowCount) continue;
-          await pool.query(
-            `INSERT INTO request_items(request_id,item_type,firearm_id) VALUES($1,'FIREARM',$2)`,
-            [reqId, q.rows[0].id]
-          );
-        } else if(it.type==='AMMO'){
-          const q = await pool.query(`SELECT id, ammo_category FROM ammunition WHERE ammo_name=$1`, [it.ident]);
-          if(!q.rowCount) continue;
-          await pool.query(
-            `INSERT INTO request_items(request_id,item_type,ammo_id,quantity,ammo_category) VALUES($1,'AMMO',$2,$3,$4)`,
-            [reqId, q.rows[0].id, it.qty||0, q.rows[0].ammo_category]
-          );
+    for(const it of items){
+      if(it.type==='FIREARM'){
+        // id 우선, 없으면 번호로 조회
+        const q = it.firearm_id
+          ? { rowCount: 1, rows: [{ id: it.firearm_id }] }
+          : await pool.query(`SELECT id FROM firearms WHERE firearm_number=$1`, [it.ident]);
+        if(!q.rowCount) continue;
+        await pool.query(
+          `INSERT INTO request_items(request_id,item_type,firearm_id) VALUES($1,'FIREARM',$2)`,
+          [reqId, q.rows[0].id]
+        );
+      } else if(it.type==='AMMO'){
+        // id 우선, 없으면 이름으로 조회
+        const q = it.ammo_id
+          ? await pool.query(`SELECT id, ammo_category, quantity FROM ammunition WHERE id=$1`, [it.ammo_id])
+          : await pool.query(`SELECT id, ammo_category, quantity FROM ammunition WHERE ammo_name=$1`, [it.ident]);
+        if(!q.rowCount) continue;
+        const row = q.rows[0];
+        const qty = Number(it.qty||0);
+        if (request_type === 'DISPATCH' && qty > row.quantity) {
+          return res.status(400).json({ error: `재고 부족: ${it.ident||row.id} (보유 ${row.quantity})` });
         }
+        await pool.query(
+          `INSERT INTO request_items(request_id,item_type,ammo_id,quantity,ammo_category) VALUES($1,'AMMO',$2,$3,$4)`,
+          [reqId, row.id, qty, row.ammo_category]
+        );
       }
-      res.json({ ok:true, id:reqId });
-    }catch(e){ console.error(e); res.status(500).json({error:'create failed'}); }
-  });
+    }
+    res.json({ ok:true, id:reqId });
+  }catch(e){ console.error(e); res.status(500).json({error:'create failed'}); }
+});
 
   // 2) 신청 목록
   app.get('/api/requests', async (req,res)=>{
