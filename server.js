@@ -613,7 +613,7 @@ app.post('/api/requests', async (req,res)=>{
             const cur = await client.query(`SELECT id,status,firearm_number FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
             if(!cur.rowCount) throw new Error('firearm not found');
             const from = cur.rows[0].status;
-            const to = (event_type==='DISPATCH') ? '불출' : '보관';
+            const to = (event_type==='DISPATCH') ? '불출' : '불입';
             if(event_type==='DISPATCH' && from==='불출') throw new Error('already dispatched');
             await client.query(
               `INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
