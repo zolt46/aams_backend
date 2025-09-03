@@ -523,10 +523,16 @@ app.post('/api/requests', async (req,res)=>{
 
     for(const it of items){
       if(it.type==='FIREARM'){
-        // id 우선, 없으면 번호로 조회
+
+        // id 우선, 없으면 번호로 조회 — 둘 다 status까지 조회해야 함
         const q = it.firearm_id
-          ? { rowCount: 1, rows: [{ id: it.firearm_id }] }
-          : await pool.query(`SELECT id FROM firearms WHERE firearm_number=$1`, [it.ident]);
+          ? await pool.query(`SELECT id, status FROM firearms WHERE id=$1`, [it.firearm_id])
+          : await pool.query(`SELECT id, status FROM firearms WHERE firearm_number=$1`, [it.ident]);
+
+        if(!q.rowCount || !q.rows[0].status){
+          return res.status(400).json({ error: '총기 상태를 찾을 수 없습니다' });
+        }
+
         if(!q.rowCount) continue;
 
         // 요청유형별 총기 상태 검증
@@ -537,7 +543,7 @@ app.post('/api/requests', async (req,res)=>{
         if (request_type === 'RETURN' && curStatus !== '불출') {
           return res.status(400).json({ error: `불입 불가: 현재 상태가 '${curStatus}' (불출만 가능)` });
         }
-        
+
         await pool.query(
           `INSERT INTO request_items(request_id,item_type,firearm_id) VALUES($1,'FIREARM',$2)`,
           [reqId, q.rows[0].id]
