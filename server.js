@@ -5,6 +5,9 @@ require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+const path = require('path');
+
+app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
 
 // CORS 설정: 모든 도메인에서의 요청을 허용
 app.use(cors());
@@ -20,6 +23,18 @@ const pool = new Pool({
 
 // 헬스체크
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.get('/health/db', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT current_database() AS db,
+             current_user       AS db_user,
+             (SELECT count(*) FROM firearms)   AS firearms_total,
+             (SELECT count(*) FROM ammunition) AS ammo_total
+    `);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: 'db health failed' }); }
+});
 
 // === Login API (임시-평문비교) ===
 app.post('/api/login', async (req, res) => {
