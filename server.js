@@ -298,6 +298,33 @@ app.post('/api/firearms', async (req, res) => {
   }
 });
 
+// 현황(리스트) 전용: 소유자·군번·보관함·비고까지 모두 포함 + 검색/상태필터 지원
+app.get('/api/firearms_full', async (req,res)=>{
+  try{
+    const q = (req.query.q||'').trim();
+    const status = (req.query.status||'').trim(); // '' | '불입' | '불출'
+    const { rows } = await pool.query(`
+      SELECT
+        f.id, f.owner_id,
+        p.name AS owner_name, p.rank AS owner_rank, p.military_id AS owner_military_id,
+        p.unit AS owner_unit, p.position AS owner_position,
+        f.firearm_type, f.firearm_number, f.storage_locker, f.status, f.last_change, f.notes
+      FROM firearms f
+      LEFT JOIN personnel p ON p.id = f.owner_id
+      WHERE ($1 = '' OR
+             f.firearm_number ILIKE '%'||$1||'%' OR
+             f.firearm_type   ILIKE '%'||$1||'%' OR
+             p.name           ILIKE '%'||$1||'%' OR
+             p.military_id    ILIKE '%'||$1||'%' OR
+             p.unit           ILIKE '%'||$1||'%' OR
+             p.position       ILIKE '%'||$1||'%')
+        AND ($2 = '' OR f.status = $2)
+      ORDER BY f.id DESC
+    `,[q,status]);
+    res.json(rows);
+  }catch(e){ console.error(e); res.status(500).json({error:'firearms_full failed'}); }
+});
+
 // 수정
 app.put('/api/firearms/:id', async (req, res) => {
   const id = req.params.id;
@@ -703,36 +730,32 @@ app.post('/api/requests', async (req,res)=>{
 
 
 
-  // 4) 승인/거부
+// 승인: 총기 상태 토글·탄약 증감 즉시 반영 + 집행로그
 app.post('/api/requests/:id/approve', async (req,res)=>{
   try{
     const id = req.params.id;
     const approver_id = req.body?.approver_id;
 
     await withTx(async(client)=>{
-      // 요청 잠금
       const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`,[id]);
       if(!rq.rowCount) return res.status(404).json({error:'not found'});
       const r = rq.rows[0];
       if(r.status!=='SUBMITTED') return res.status(400).json({error:'not submitted'});
 
-      // 승인 이력
       await client.query(`
         INSERT INTO approvals(request_id,approver_id,decision,reason)
         VALUES($1,$2,'APPROVE',NULL)
       `,[id, approver_id||null]);
 
-      // 아이템 조회
       const items = (await client.query(`
         SELECT ri.*, f.status AS f_status, f.firearm_number, a.quantity AS a_qty
         FROM request_items ri
-        LEFT JOIN firearms f ON f.id=ri.firearm_id
+        LEFT JOIN firearms   f ON f.id=ri.firearm_id
         LEFT JOIN ammunition a ON a.id=ri.ammo_id
         WHERE ri.request_id=$1
         ORDER BY ri.id
       `,[id])).rows;
 
-      // 집행 이벤트(승인 시점 반영)
       const exec = await client.query(`
         INSERT INTO execution_events(request_id, executed_by, event_type, notes)
         VALUES($1,$2,$3,$4) RETURNING id
@@ -747,40 +770,38 @@ app.post('/api/requests/:id/approve', async (req,res)=>{
           const cur = fq.rows[0].status;
           if(cur!=='불입') throw new Error(`불출 승인 불가: 현재 상태 ${cur}`);
           await client.query(`UPDATE firearms SET status='불출', last_change=now() WHERE id=$1`,[it.firearm_id]);
-          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
-                             [execution_id, it.firearm_id, cur, '불출']);
+          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status)
+                              VALUES($1,$2,$3,$4)`,[execution_id, it.firearm_id, cur, '불출']);
         }
         // 탄약: 차감
         for(const it of items.filter(x=>x.item_type==='AMMO')){
           const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`,[it.ammo_id]);
           if(!aq.rowCount) throw new Error('탄약 없음');
-          const before = aq.rows[0].quantity;
-          const after  = before - it.quantity;
+          const before=aq.rows[0].quantity, after=before - it.quantity;
           if(after<0) throw new Error('재고 부족(승인 시)');
           await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`,[after, it.ammo_id]);
-          await client.query(`INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty) VALUES($1,$2,$3,$4,$5)`,
-                             [execution_id, it.ammo_id, -it.quantity, before, after]);
+          await client.query(`INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty)
+                              VALUES($1,$2,$3,$4,$5)`,[execution_id, it.ammo_id, -it.quantity, before, after]);
         }
       }else{ // RETURN
         // 총기: 불출 → 불입
         for(const it of items.filter(x=>x.item_type==='FIREARM')){
           const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`,[it.firearm_id]);
           if(!fq.rowCount) throw new Error('총기 없음');
-          const cur = fq.rows[0].status;
+          const cur=fq.rows[0].status;
           if(cur!=='불출') throw new Error(`불입 승인 불가: 현재 상태 ${cur}`);
           await client.query(`UPDATE firearms SET status='불입', last_change=now() WHERE id=$1`,[it.firearm_id]);
-          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
-                             [execution_id, it.firearm_id, cur, '불입']);
+          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status)
+                              VALUES($1,$2,$3,$4)`,[execution_id, it.firearm_id, cur, '불입']);
         }
         // 탄약: 증가
         for(const it of items.filter(x=>x.item_type==='AMMO')){
           const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`,[it.ammo_id]);
           if(!aq.rowCount) throw new Error('탄약 없음');
-          const before = aq.rows[0].quantity;
-          const after  = before + it.quantity;
+          const before=aq.rows[0].quantity, after=before + it.quantity;
           await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`,[after, it.ammo_id]);
-          await client.query(`INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty) VALUES($1,$2,$3,$4,$5)`,
-                             [execution_id, it.ammo_id, +it.quantity, before, after]);
+          await client.query(`INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty)
+                              VALUES($1,$2,$3,$4,$5)`,[execution_id, it.ammo_id, +it.quantity, before, after]);
         }
       }
 
@@ -789,6 +810,7 @@ app.post('/api/requests/:id/approve', async (req,res)=>{
     });
   }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
 });
+
 
 
 app.post('/api/requests/:id/reject', async (req,res)=>{
