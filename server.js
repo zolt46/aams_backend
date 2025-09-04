@@ -216,48 +216,34 @@ app.delete('/api/personnel/:id', async (req, res) => {
 
 // 목록 조회 (JOIN: 프론트가 owner_* 그대로 사용)
 // ===== Firearms API (검색/가용 필터 지원) =====
-app.get('/api/firearms', async (req, res) => {
-  try {
-    const { q, status, limit, availableOnly } = req.query;
-    const args = [];
-    let sql = `
-      SELECT
-        f.id,
-        f.owner_id,
-        p.name         AS owner_name,
-        p.rank         AS owner_rank,
-        p.military_id  AS owner_military_id,
-        p.unit         AS owner_unit,
-        p.position     AS owner_position,
-        f.firearm_type,
-        f.firearm_number,
-        f.storage_locker,
-        f.status,
-        f.last_change,
-        f.notes
-      FROM firearms f
-      LEFT JOIN personnel p ON f.owner_id = p.id
-      WHERE 1=1
-    `;
-    if (status) { args.push(status); sql += ` AND f.status = $${args.length}`; }
-    if (q) {
-      args.push(`%${q}%`); sql += ` AND (f.firearm_number ILIKE $${args.length}`;
-      args.push(`%${q}%`); sql += ` OR f.firearm_type  ILIKE $${args.length})`;
-    }
-    if (availableOnly === 'true') {
-      // 프로젝트 용어에 맞게: '불출'이 아닌 것만 가용
-      args.push('불출'); sql += ` AND f.status <> $${args.length}`;
-    }
-    sql += ` ORDER BY f.id DESC`;
-    if (limit) { args.push(Number(limit) || 50); sql += ` LIMIT $${args.length}`; }
+// 총기 검색: 상태 필터 + 예약 중(제출/승인)인 총기는 제외
+app.get('/api/firearms', async (req,res)=>{
+  try{
+    const q = (req.query.q||'').trim();
+    const status = (req.query.status||'').trim(); // '불입' or '불출' or ''
+    const limit = Math.min(parseInt(req.query.limit||'50',10)||50, 100);
 
-    const { rows } = await pool.query(sql, args);
+    const { rows } = await pool.query(`
+      SELECT f.id, f.firearm_number, f.firearm_type, f.status
+      FROM firearms f
+      WHERE ($1 = '' OR f.firearm_number ILIKE '%'||$1||'%' OR f.firearm_type ILIKE '%'||$1||'%')
+        AND ($2 = '' OR f.status = $2)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM request_items ri
+          JOIN requests r ON r.id = ri.request_id
+          WHERE ri.item_type='FIREARM'
+            AND ri.firearm_id = f.id
+            AND r.status IN ('SUBMITTED','APPROVED')
+        )
+      ORDER BY f.firearm_number
+      LIMIT $3
+    `,[q, status, limit]);
+
     res.json(rows);
-  } catch (err) {
-    console.error('Error fetching firearms data:', err);
-    res.status(500).json({ error: 'Failed to fetch firearms data' });
-  }
+  }catch(e){ console.error(e); res.status(500).json({error:'firearms search failed'}); }
 });
+
 
 // 단건 조회(선택)
 app.get('/api/firearms/:id', async (req, res) => {
@@ -364,31 +350,33 @@ app.delete('/api/firearms/:id', async (req, res) => {
 
 // 목록 조회
 // ===== Ammunition API (검색 지원) =====
-app.get('/api/ammunition', async (req, res) => {
-  try {
-    const { q, status, limit } = req.query;
-    const args = [];
-    let sql = `
-      SELECT
-        id, ammo_name, ammo_category, quantity, storage_locker,
-        status, last_change, notes
-      FROM ammunition
-      WHERE 1=1
-    `;
-    if (status) { args.push(status); sql += ` AND status = $${args.length}`; }
-    if (q) {
-      args.push(`%${q}%`); sql += ` AND (ammo_name ILIKE $${args.length}`;
-      args.push(`%${q}%`); sql += ` OR ammo_category ILIKE $${args.length})`;
-    }
-    sql += ` ORDER BY id DESC`;
-    if (limit) { args.push(Number(limit) || 50); sql += ` LIMIT $${args.length}`; }
-    const { rows } = await pool.query(sql, args);
+// 탄약 검색: 가용재고(available = quantity - 예약)까지 리턴
+app.get('/api/ammunition', async (req,res)=>{
+  try{
+    const q = (req.query.q||'').trim();
+    const limit = Math.min(parseInt(req.query.limit||'50',10)||50, 100);
+
+    const { rows } = await pool.query(`
+      SELECT a.id, a.ammo_name, a.ammo_category, a.quantity,
+             (a.quantity - COALESCE((
+               SELECT SUM(ri.quantity)
+               FROM request_items ri
+               JOIN requests r2 ON r2.id=ri.request_id
+               WHERE ri.item_type='AMMO'
+                 AND ri.ammo_id=a.id
+                 AND r2.request_type='DISPATCH'
+                 AND r2.status IN ('SUBMITTED','APPROVED')
+             ),0))::int AS available
+      FROM ammunition a
+      WHERE ($1 = '' OR a.ammo_name ILIKE '%'||$1||'%' OR a.ammo_category ILIKE '%'||$1||'%')
+      ORDER BY a.ammo_name
+      LIMIT $2
+    `,[q, limit]);
+
     res.json(rows);
-  } catch (err) {
-    console.error('Error fetching ammunition data:', err);
-    res.status(500).json({ error: 'Failed to fetch ammunition data' });
-  }
+  }catch(e){ console.error(e); res.status(500).json({error:'ammunition search failed'}); }
 });
+
 
 // 단건 조회(선택)
 app.get('/api/ammunition/:id', async (req, res) => {
@@ -515,17 +503,17 @@ app.post('/api/requests', async (req,res)=>{
   try{
     const { requester_id, request_type, purpose, location, scheduled_at, notes, items=[] } = req.body;
 
-    // 서버측 필수값 검증
-    const miss = [];
+    // 서버측 필수검증
+    const miss=[];
     if(!requester_id) miss.push('requester_id');
     if(!request_type) miss.push('request_type');
     if(!scheduled_at) miss.push('scheduled_at');
-    if(!purpose)      miss.push('purpose');
-    if(!location)     miss.push('location');
+    if(!purpose) miss.push('purpose');
+    if(!location) miss.push('location');
     if(!Array.isArray(items) || items.length===0) miss.push('items');
-    if(miss.length) return res.status(400).json({ error:`missing fields: ${miss.join(', ')}` });
+    if(miss.length) return res.status(400).json({error:`missing fields: ${miss.join(', ')}`});
 
-    await withTx(async (client)=>{
+    await withTx(async(client)=>{
       // 요청 생성
       const r = await client.query(
         `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at,notes)
@@ -534,59 +522,71 @@ app.post('/api/requests', async (req,res)=>{
       );
       const reqId = r.rows[0].id;
 
-      // 라인 처리
+      // 아이템 처리
       for(const it of items){
         if(it.type==='FIREARM'){
-          // 항상 DB에서 id,status 조회
-          const q = it.firearm_id
-            ? await client.query(`SELECT id, status FROM firearms WHERE id=$1`, [it.firearm_id])
-            : await client.query(`SELECT id, status FROM firearms WHERE firearm_number=$1`, [it.ident]);
-          if(!q.rowCount || !q.rows[0].status){
-            throw new Error('총기 상태를 찾을 수 없습니다');
-          }
+          // 해당 총기 행 잠금 + 중복 신청 존재 여부 체크
+          const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id || it.id]);
+          if(!fq.rowCount) throw new Error('총기를 찾을 수 없습니다');
+          const f = fq.rows[0];
 
-          const curStatus = q.rows[0].status;
-          if (request_type === 'DISPATCH' && curStatus !== '불입') {
-            throw new Error(`불출 불가: 현재 상태가 '${curStatus}' (불입만 가능)`);
-          }
-          if (request_type === 'RETURN' && curStatus !== '불출') {
-            throw new Error(`불입 불가: 현재 상태가 '${curStatus}' (불출만 가능)`);
-          }
+          // 요청유형과 현재상태 호환성
+          if(request_type==='DISPATCH' && f.status!=='불입')
+            throw new Error(`불출 불가: 현재 상태가 '${f.status}' (불입만 가능)`);
+          if(request_type==='RETURN' && f.status!=='불출')
+            throw new Error(`불입 불가: 현재 상태가 '${f.status}' (불출만 가능)`);
+
+          // 이미 제출/승인 대기 중인 신청이 있으면 차단
+          const dup = await client.query(`
+            SELECT 1
+            FROM request_items ri JOIN requests r2 ON r2.id=ri.request_id
+            WHERE ri.item_type='FIREARM' AND ri.firearm_id=$1
+              AND r2.status IN ('SUBMITTED','APPROVED')
+            LIMIT 1
+          `,[f.id]);
+          if(dup.rowCount) throw new Error('해당 총기에 진행 중인 다른 신청이 있습니다');
 
           await client.query(
             `INSERT INTO request_items(request_id,item_type,firearm_id) VALUES($1,'FIREARM',$2)`,
-            [reqId, q.rows[0].id]
+            [reqId, f.id]
           );
 
         } else if(it.type==='AMMO'){
-          const q = it.ammo_id
-            ? await client.query(`SELECT id, ammo_category, quantity FROM ammunition WHERE id=$1`, [it.ammo_id])
-            : await client.query(`SELECT id, ammo_category, quantity FROM ammunition WHERE ammo_name=$1`, [it.ident]);
-          if(!q.rowCount) throw new Error('탄약을 찾을 수 없습니다');
-          const row = q.rows[0];
-          const qty = Number(it.qty||0);
-          if(!Number.isInteger(qty) || qty <= 0) throw new Error('탄약 수량이 올바르지 않습니다');
+          const aq = await client.query(`
+            SELECT a.id, a.quantity,
+                   (a.quantity - COALESCE((
+                      SELECT SUM(ri.quantity)
+                      FROM request_items ri JOIN requests r2 ON r2.id=ri.request_id
+                      WHERE ri.item_type='AMMO' AND ri.ammo_id=a.id
+                        AND r2.request_type='DISPATCH'
+                        AND r2.status IN ('SUBMITTED','APPROVED')
+                   ),0))::int AS available
+            FROM ammunition a
+            WHERE a.id=$1
+            FOR UPDATE
+          `,[it.ammo_id || it.id]);
+          if(!aq.rowCount) throw new Error('탄약을 찾을 수 없습니다');
+          const a = aq.rows[0];
+          const qty = parseInt(it.qty,10);
+          if(!Number.isInteger(qty) || qty<=0) throw new Error('탄약 수량이 올바르지 않습니다');
 
-          if (request_type === 'DISPATCH' && qty > row.quantity) {
-            throw new Error(`재고 부족: ${it.ident||row.id} (보유 ${row.quantity})`);
-          }
+          // 제출 시점에 예약 포함 가용재고로 검증(과예약 방지)
+          if(request_type==='DISPATCH' && qty>a.available)
+            throw new Error(`재고 부족(예약 포함): 보유 ${a.quantity}, 가용 ${a.available}`);
+
           await client.query(
-            `INSERT INTO request_items(request_id,item_type,ammo_id,quantity,ammo_category)
-             VALUES($1,'AMMO',$2,$3,$4)`,
-            [reqId, row.id, qty, row.ammo_category]
+            `INSERT INTO request_items(request_id,item_type,ammo_id,quantity)
+             VALUES($1,'AMMO',$2,$3)`,
+            [reqId, a.id, qty]
           );
-        } else {
+        }else{
           throw new Error('알 수 없는 항목 타입');
         }
       }
 
-      res.json({ ok:true, id:reqId });
+      res.json({ok:true, id:reqId});
     });
-  }catch(e){
-    console.error(e);
-    // 트랜잭션 안에서 던진 에러는 여기로 오며 롤백됨
-    res.status(400).json({ error:String(e.message||e) });
-  }
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
 });
 
 
@@ -704,81 +704,138 @@ app.post('/api/requests', async (req,res)=>{
 
 
   // 4) 승인/거부
-  app.post('/api/requests/:id/approve', async (req,res)=>{
-    try{
-      const approver_id = req.body?.approver_id || 1; // 실제 인증 연동 시 토큰에서 추출
-      await withTx(async(client)=>{
-        await client.query(`INSERT INTO approvals(request_id, approver_id, decision) VALUES($1,$2,'APPROVE')`, [req.params.id, approver_id]);
-        await client.query(`UPDATE requests SET status='APPROVED', updated_at=now() WHERE id=$1`, [req.params.id]);
-      });
-      res.json({ok:true});
-    }catch(e){ console.error(e); res.status(500).json({error:'approve failed'}); }
-  });
+app.post('/api/requests/:id/approve', async (req,res)=>{
+  try{
+    const id = req.params.id;
+    const approver_id = req.body?.approver_id;
 
-  app.post('/api/requests/:id/reject', async (req,res)=>{
-    try{
-      const { reason, approver_id } = req.body||{};
-      await withTx(async(client)=>{
-        await client.query(`INSERT INTO approvals(request_id, approver_id, decision, reason) VALUES($1,$2,'REJECT',$3)`, [req.params.id, approver_id||1, reason||null]);
-        await client.query(`UPDATE requests SET status='REJECTED', updated_at=now() WHERE id=$1`, [req.params.id]);
-      });
+    await withTx(async(client)=>{
+      // 요청 잠금
+      const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`,[id]);
+      if(!rq.rowCount) return res.status(404).json({error:'not found'});
+      const r = rq.rows[0];
+      if(r.status!=='SUBMITTED') return res.status(400).json({error:'not submitted'});
+
+      // 승인 이력
+      await client.query(`
+        INSERT INTO approvals(request_id,approver_id,decision,reason)
+        VALUES($1,$2,'APPROVE',NULL)
+      `,[id, approver_id||null]);
+
+      // 아이템 조회
+      const items = (await client.query(`
+        SELECT ri.*, f.status AS f_status, f.firearm_number, a.quantity AS a_qty
+        FROM request_items ri
+        LEFT JOIN firearms f ON f.id=ri.firearm_id
+        LEFT JOIN ammunition a ON a.id=ri.ammo_id
+        WHERE ri.request_id=$1
+        ORDER BY ri.id
+      `,[id])).rows;
+
+      // 집행 이벤트(승인 시점 반영)
+      const exec = await client.query(`
+        INSERT INTO execution_events(request_id, executed_by, event_type, notes)
+        VALUES($1,$2,$3,$4) RETURNING id
+      `,[id, approver_id||null, r.request_type, 'AUTO: inventory committed at approval']);
+      const execution_id = exec.rows[0].id;
+
+      if(r.request_type==='DISPATCH'){
+        // 총기: 불입 → 불출
+        for(const it of items.filter(x=>x.item_type==='FIREARM')){
+          const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`,[it.firearm_id]);
+          if(!fq.rowCount) throw new Error('총기 없음');
+          const cur = fq.rows[0].status;
+          if(cur!=='불입') throw new Error(`불출 승인 불가: 현재 상태 ${cur}`);
+          await client.query(`UPDATE firearms SET status='불출', last_change=now() WHERE id=$1`,[it.firearm_id]);
+          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
+                             [execution_id, it.firearm_id, cur, '불출']);
+        }
+        // 탄약: 차감
+        for(const it of items.filter(x=>x.item_type==='AMMO')){
+          const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`,[it.ammo_id]);
+          if(!aq.rowCount) throw new Error('탄약 없음');
+          const before = aq.rows[0].quantity;
+          const after  = before - it.quantity;
+          if(after<0) throw new Error('재고 부족(승인 시)');
+          await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`,[after, it.ammo_id]);
+          await client.query(`INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty) VALUES($1,$2,$3,$4,$5)`,
+                             [execution_id, it.ammo_id, -it.quantity, before, after]);
+        }
+      }else{ // RETURN
+        // 총기: 불출 → 불입
+        for(const it of items.filter(x=>x.item_type==='FIREARM')){
+          const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`,[it.firearm_id]);
+          if(!fq.rowCount) throw new Error('총기 없음');
+          const cur = fq.rows[0].status;
+          if(cur!=='불출') throw new Error(`불입 승인 불가: 현재 상태 ${cur}`);
+          await client.query(`UPDATE firearms SET status='불입', last_change=now() WHERE id=$1`,[it.firearm_id]);
+          await client.query(`INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
+                             [execution_id, it.firearm_id, cur, '불입']);
+        }
+        // 탄약: 증가
+        for(const it of items.filter(x=>x.item_type==='AMMO')){
+          const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`,[it.ammo_id]);
+          if(!aq.rowCount) throw new Error('탄약 없음');
+          const before = aq.rows[0].quantity;
+          const after  = before + it.quantity;
+          await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`,[after, it.ammo_id]);
+          await client.query(`INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty) VALUES($1,$2,$3,$4,$5)`,
+                             [execution_id, it.ammo_id, +it.quantity, before, after]);
+        }
+      }
+
+      await client.query(`UPDATE requests SET status='APPROVED', updated_at=now() WHERE id=$1`,[id]);
       res.json({ok:true});
-    }catch(e){ console.error(e); res.status(500).json({error:'reject failed'}); }
-  });
+    });
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
+
+
+app.post('/api/requests/:id/reject', async (req,res)=>{
+  try{
+    const id = req.params.id;
+    const { approver_id, reason } = req.body||{};
+    await withTx(async(client)=>{
+      const rq=await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`,[id]);
+      if(!rq.rowCount) return res.status(404).json({error:'not found'});
+      const r=rq.rows[0];
+      if(r.status!=='SUBMITTED') return res.status(400).json({error:'not submitted'});
+
+      await client.query(`
+        INSERT INTO approvals(request_id,approver_id,decision,reason)
+        VALUES($1,$2,'REJECT',$3)
+      `,[id, approver_id||null, reason||null]);
+
+      await client.query(`UPDATE requests SET status='REJECTED', updated_at=now() WHERE id=$1`,[id]);
+
+      res.json({ok:true});
+    });
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
+
 
   // 5) 집행(요청유형 기반으로 자동 DISPATCH/RETURN)
-  app.post('/api/requests/:id/execute', async (req,res)=>{
-    try{
-      const { executed_by } = req.body||{};
-      const exec_by = executed_by || 1; // 실제 인증 연동 시 토큰에서 추출
-      const reqId = req.params.id;
+ app.post('/api/requests/:id/execute', async (req,res)=>{
+  try{
+    const id = req.params.id;
+    const executed_by = req.body?.executed_by || null;
+    await withTx(async(client)=>{
+      const rq=await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`,[id]);
+      if(!rq.rowCount) return res.status(404).json({error:'not found'});
+      const r=rq.rows[0];
+      if(r.status!=='APPROVED') return res.status(400).json({error:'not approved'});
 
-      await withTx(async(client)=>{
-        const r = await client.query(`SELECT status, request_type FROM requests WHERE id=$1 FOR UPDATE`, [reqId]);
-        if(!r.rowCount) throw new Error('request not found');
-        if(r.rows[0].status!=='APPROVED') throw new Error('not approved');
-        const event_type = (r.rows[0].request_type === 'RETURN') ? 'RETURN' : 'DISPATCH';
+      // 재고/상태는 승인 시 이미 반영되었음. 집행 이벤트/상태만 갱신.
+      await client.query(`
+        INSERT INTO execution_events(request_id, executed_by, event_type, notes)
+        VALUES($1,$2,$3,$4)
+      `,[id, executed_by, r.request_type, 'MARK EXECUTED']);
 
-        const exec = await client.query(
-          `INSERT INTO execution_events(request_id,executed_by,event_type) VALUES($1,$2,$3) RETURNING id,executed_at`,
-          [reqId, exec_by, event_type]
-        );
-        const execId = exec.rows[0].id;
-
-        const items = (await client.query(`SELECT * FROM request_items WHERE request_id=$1`, [reqId])).rows;
-
-        for(const it of items){
-          if(it.item_type==='FIREARM'){
-            const cur = await client.query(`SELECT id,status,firearm_number FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
-            if(!cur.rowCount) throw new Error('firearm not found');
-            const from = cur.rows[0].status;
-            const to = (event_type==='DISPATCH') ? '불출' : '불입';
-            if(event_type==='DISPATCH' && from==='불출') throw new Error('already dispatched');
-            await client.query(
-              `INSERT INTO firearm_status_changes(execution_id,firearm_id,from_status,to_status) VALUES($1,$2,$3,$4)`,
-              [execId, it.firearm_id, from, to]
-            );
-            await client.query(`UPDATE firearms SET status=$1, last_change=now() WHERE id=$2`, [to, it.firearm_id]);
-          } else if(it.item_type==='AMMO'){
-            const cur = await client.query(`SELECT id,quantity,ammo_name FROM ammunition WHERE id=$1 FOR UPDATE`, [it.ammo_id]);
-            if(!cur.rowCount) throw new Error('ammo not found');
-            const before = cur.rows[0].quantity;
-            const delta  = (event_type==='DISPATCH') ? -(it.quantity||0) : +(it.quantity||0);
-            const after  = before + delta;
-            if(after<0) throw new Error('insufficient ammo');
-            await client.query(
-              `INSERT INTO ammo_movements(execution_id,ammo_id,delta,before_qty,after_qty) VALUES($1,$2,$3,$4,$5)`,
-              [execId, it.ammo_id, delta, before, after]
-            );
-            await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`, [after, it.ammo_id]);
-          }
-        }
-        await client.query(`UPDATE requests SET status='EXECUTED', updated_at=now() WHERE id=$1`, [reqId]);
-      });
-
+      await client.query(`UPDATE requests SET status='EXECUTED', updated_at=now() WHERE id=$1`,[id]);
       res.json({ok:true});
-    }catch(e){ console.error(e); res.status(400).json({error:'execute failed', detail:String(e)}); }
-  });
+    });
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
 
   // 6) 집행 로그 (총기/탄약 변화까지 집계)
   app.get('/api/executions', async (req,res)=>{
