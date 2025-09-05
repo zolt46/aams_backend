@@ -385,6 +385,7 @@ app.get('/api/ammunition', async (req,res)=>{
 
     const { rows } = await pool.query(`
       SELECT a.id, a.ammo_name, a.ammo_category, a.quantity,
+            a.storage_locker, a.status, a.last_change, a.notes,
              (a.quantity - COALESCE((
                SELECT SUM(ri.quantity)
                FROM request_items ri
