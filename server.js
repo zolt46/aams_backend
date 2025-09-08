@@ -366,6 +366,12 @@ app.delete('/api/firearms/:id', async (req, res) => {
     if (!rowCount) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
   } catch (err) {
+    if (err && err.code === '23503') {
+      return res.status(409).json({
+        error: 'conflict_foreign_key',
+        message: '요청/이력에서 해당 총기를 참조 중이라 삭제할 수 없습니다.'
+      });
+    }
     console.error('Error deleting firearm:', err);
     res.status(500).json({ error: 'delete failed' });
   }
