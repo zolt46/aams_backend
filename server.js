@@ -194,7 +194,7 @@ app.put('/api/personnel/:id', async (req, res) => {
       args = [name, rank, military_id, unit, position, user_id, !!is_admin, contact ?? null, notes ?? null, id];
     }
     const { rows } = await pool.query(q, args);
-    
+
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(rows[0]);
   } catch (err) {
@@ -236,12 +236,24 @@ app.get('/api/firearms', async (req,res)=>{
     const q = (req.query.q||'').trim();
     const status = (req.query.status||'').trim(); // '불입' or '불출' or ''
     const limit = Math.min(parseInt(req.query.limit||'50',10)||50, 100);
+    const requesterId = parseInt(req.query.requester_id||'0',10) || null;
+
+    // requester_id가 들어오면 is_admin 여부를 확인해 비관리자면 owner 제한
+    let ownerClause = '';
+    let args = [q, status];
+    if (requesterId) {
+      const r = await pool.query(`SELECT is_admin FROM personnel WHERE id=$1`, [requesterId]);
+      const isAdmin = !!(r.rowCount && r.rows[0].is_admin);
+      if (!isAdmin) { ownerClause = ` AND f.owner_id = $${args.length+1}`; args.push(requesterId); }
+    }
+    args.push(limit);
 
     const { rows } = await pool.query(`
       SELECT f.id, f.firearm_number, f.firearm_type, f.status
       FROM firearms f
       WHERE ($1 = '' OR f.firearm_number ILIKE '%'||$1||'%' OR f.firearm_type ILIKE '%'||$1||'%')
         AND ($2 = '' OR f.status = $2)
+        ${ownerClause}
         AND NOT EXISTS (
           SELECT 1
           FROM request_items ri
@@ -251,8 +263,8 @@ app.get('/api/firearms', async (req,res)=>{
             AND r.status IN ('SUBMITTED','APPROVED')
         )
       ORDER BY f.firearm_number
-      LIMIT $3
-    `,[q, status, limit]);
+      LIMIT $${args.length}
+    `, args);
 
     res.json(rows);
   }catch(e){ console.error(e); res.status(500).json({error:'firearms search failed'}); }
@@ -562,6 +574,11 @@ app.post('/api/requests', async (req,res)=>{
     if(miss.length) return res.status(400).json({error:`missing fields: ${miss.join(', ')}`});
 
     await withTx(async(client)=>{
+      // 요청자 권한 확인
+      const who = await client.query(`SELECT is_admin FROM personnel WHERE id=$1`, [requester_id]);
+      if(!who.rowCount) throw new Error('요청자 없음');
+      const isAdmin = !!who.rows[0].is_admin;
+
       // 요청 생성
       const r = await client.query(
         `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at,notes)
@@ -577,6 +594,9 @@ app.post('/api/requests', async (req,res)=>{
           const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id || it.id]);
           if(!fq.rowCount) throw new Error('총기를 찾을 수 없습니다');
           const f = fq.rows[0];
+          if(!isAdmin && f.owner_id !== requester_id) {
+            throw new Error('일반 사용자는 본인 총기만 신청할 수 있습니다');
+          }
 
           // 요청유형과 현재상태 호환성
           if(request_type==='DISPATCH' && f.status!=='불입')
@@ -600,6 +620,7 @@ app.post('/api/requests', async (req,res)=>{
           );
 
         } else if(it.type==='AMMO'){
+          if(!isAdmin) throw new Error('일반 사용자는 탄약을 신청할 수 없습니다');
           const aq = await client.query(`
             SELECT a.id, a.quantity,
                    (a.quantity - COALESCE((
