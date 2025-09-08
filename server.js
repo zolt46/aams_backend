@@ -101,7 +101,8 @@ app.get('/api/personnel/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, name, rank, military_id, unit, position,
-              user_id, is_admin, contact, last_modified, notes
+              user_id, is_admin, contact, last_modified, notes,
+              password_hash
        FROM personnel WHERE id=$1`,
       [req.params.id]
     );
@@ -168,19 +169,32 @@ app.put('/api/personnel/:id', async (req, res) => {
   }
 
   try {
-    const q = `
-      UPDATE personnel SET
-        name=$1, rank=$2, military_id=$3, unit=$4, position=$5,
-        user_id=$6, password_hash=$7, is_admin=$8, contact=$9, notes=$10,
-        last_modified=CURRENT_TIMESTAMP
-      WHERE id=$11
-      RETURNING id, name, rank, military_id, unit, position,
-                user_id, is_admin, contact, last_modified, notes`;
-    const { rows } = await pool.query(q, [
-      name, rank, military_id, unit, position,
-      user_id, password_hash ?? '', !!is_admin, contact ?? null, notes ?? null,
-      id
-    ]);
+    // 비밀번호가 비었거나 undefined인 경우, 컬럼 업데이트 생략
+    const passGiven = (password_hash !== undefined && password_hash !== null && String(password_hash) !== '');
+    let q, args;
+    if (passGiven) {
+      q = `
+        UPDATE personnel SET
+          name=$1, rank=$2, military_id=$3, unit=$4, position=$5,
+          user_id=$6, password_hash=$7, is_admin=$8, contact=$9, notes=$10,
+          last_modified=CURRENT_TIMESTAMP
+        WHERE id=$11
+        RETURNING id, name, rank, military_id, unit, position,
+                  user_id, is_admin, contact, last_modified, notes`;
+      args = [name, rank, military_id, unit, position, user_id, password_hash, !!is_admin, contact ?? null, notes ?? null, id];
+    } else {
+      q = `
+        UPDATE personnel SET
+          name=$1, rank=$2, military_id=$3, unit=$4, position=$5,
+          user_id=$6, is_admin=$7, contact=$8, notes=$9,
+          last_modified=CURRENT_TIMESTAMP
+        WHERE id=$10
+        RETURNING id, name, rank, military_id, unit, position,
+                  user_id, is_admin, contact, last_modified, notes`;
+      args = [name, rank, military_id, unit, position, user_id, !!is_admin, contact ?? null, notes ?? null, id];
+    }
+    const { rows } = await pool.query(q, args);
+    
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(rows[0]);
   } catch (err) {
