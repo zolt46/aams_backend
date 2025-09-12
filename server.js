@@ -237,12 +237,15 @@ app.get('/api/firearms', async (req,res)=>{
     const status = (req.query.status||'').trim(); // '불입' or '불출' or ''
     const limit = Math.min(parseInt(req.query.limit||'50',10)||50, 100);
     const requesterId = parseInt(req.query.requester_id||'0',10) || null;
+    const ownerId     = parseInt(req.query.owner_id||'0',10) || null; // ★ 추가
     const idEq = parseInt(req.query.id||'0',10) || null;
 
     // requester_id가 들어오면 is_admin 여부를 확인해 비관리자면 owner 제한
     let ownerClause = '';
     let args = [q, status];
-    if (requesterId) {
+    if (ownerId) {
+      ownerClause = ` AND f.owner_id = $${args.length+1}`; args.push(ownerId);
+    } else if (requesterId) {
       const r = await pool.query(`SELECT is_admin FROM personnel WHERE id=$1`, [requesterId]);
       const isAdmin = !!(r.rowCount && r.rows[0].is_admin);
       if (!isAdmin) { ownerClause = ` AND f.owner_id = $${args.length+1}`; args.push(requesterId); }
