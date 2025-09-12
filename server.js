@@ -237,6 +237,7 @@ app.get('/api/firearms', async (req,res)=>{
     const status = (req.query.status||'').trim(); // '불입' or '불출' or ''
     const limit = Math.min(parseInt(req.query.limit||'50',10)||50, 100);
     const requesterId = parseInt(req.query.requester_id||'0',10) || null;
+    const idEq = parseInt(req.query.id||'0',10) || null;
 
     // requester_id가 들어오면 is_admin 여부를 확인해 비관리자면 owner 제한
     let ownerClause = '';
@@ -245,6 +246,22 @@ app.get('/api/firearms', async (req,res)=>{
       const r = await pool.query(`SELECT is_admin FROM personnel WHERE id=$1`, [requesterId]);
       const isAdmin = !!(r.rowCount && r.rows[0].is_admin);
       if (!isAdmin) { ownerClause = ` AND f.owner_id = $${args.length+1}`; args.push(requesterId); }
+    }
+
+    // id 단건 조회 우선
+    if (idEq) {
+      const { rows } = await pool.query(`
+        SELECT f.id, f.firearm_number, f.firearm_type, f.status, f.storage_locker,
+          EXISTS(
+            SELECT 1
+            FROM request_items ri JOIN requests r ON r.id=ri.request_id
+            WHERE ri.item_type='FIREARM' AND ri.firearm_id=f.id
+              AND r.status IN ('SUBMITTED','APPROVED')
+          ) AS reserved
+        FROM firearms f
+        WHERE f.id=$1
+      `,[idEq]);
+      return res.json(rows);
     }
     args.push(limit);
 
@@ -416,19 +433,16 @@ app.get('/api/ammunition', async (req,res)=>{
     const limit = Math.min(parseInt(req.query.limit||'50',10)||50, 100);
 
     const { rows } = await pool.query(`
-      SELECT a.id, a.ammo_name, a.ammo_category, a.quantity,
-            a.storage_locker, a.status, a.last_change, a.notes,
-             (a.quantity - COALESCE((
-               SELECT SUM(ri.quantity)
-               FROM request_items ri
-               JOIN requests r2 ON r2.id=ri.request_id
-               WHERE ri.item_type='AMMO'
-                 AND ri.ammo_id=a.id
-                 AND r2.request_type='DISPATCH'
-                 AND r2.status IN ('SUBMITTED','APPROVED')
-             ),0))::int AS available
+      SELECT a.id, a.ammo_name, a.ammo_category, a.quantity, a.storage_locker, a.status,
+        (a.quantity - COALESCE((
+          SELECT SUM(ri.quantity)
+          FROM request_items ri JOIN requests r ON r.id=ri.request_id
+          WHERE ri.item_type='AMMO' AND ri.ammo_id=a.id
+            AND r.request_type='DISPATCH'
+            AND r.status IN ('SUBMITTED','APPROVED')
+        ),0))::int AS available
       FROM ammunition a
-      WHERE ($1 = '' OR a.ammo_name ILIKE '%'||$1||'%' OR a.ammo_category ILIKE '%'||$1||'%')
+      WHERE ($1='' OR a.ammo_name ILIKE '%'||$1||'%' OR a.ammo_category ILIKE '%'||$1||'%')
       ORDER BY a.ammo_name
       LIMIT $2
     `,[q, limit]);
