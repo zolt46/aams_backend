@@ -924,6 +924,331 @@ app.post('/api/requests/:id/reject', async (req,res)=>{
   });
 
 
+  /* ======================================================
+ * Duty Roster API
+ * ====================================================== */
+
+function kTypeKR(t){ return t==='DISPATCH'?'불출':(t==='RETURN'?'불입':t); }
+
+// 공통: 요청 생성(+ 항목)
+async function createRequestWithItems(client, {requester_id, type, purpose, location, scheduled_at, items}) {
+  const r = await client.query(
+    `INSERT INTO requests(requester_id,request_type,purpose,location,scheduled_at)
+     VALUES($1,$2,$3,$4,$5) RETURNING id`,
+    [requester_id, type, purpose, location, scheduled_at]
+  );
+  const reqId = r.rows[0].id;
+  for (const it of items) {
+    if (it.type==='FIREARM') {
+      await client.query(
+        `INSERT INTO request_items(request_id,item_type,firearm_id)
+         VALUES($1,'FIREARM',$2)`, [reqId, it.firearm_id]
+      );
+    } else if (it.type==='AMMO') {
+      await client.query(
+        `INSERT INTO request_items(request_id,item_type,ammo_id,quantity)
+         VALUES($1,'AMMO',$2,$3)`, [reqId, it.ammo_id, it.quantity]
+      );
+    }
+  }
+  return reqId;
+}
+
+// 공통: 요청 자동 승인(+집행)
+async function approveAndMaybeExecute(client, {request_id, approver_id, doExecute=false}) {
+  // 승인
+  await client.query(
+    `INSERT INTO approvals(request_id,approver_id,decision,reason)
+     VALUES($1,$2,'APPROVE','auto by roster')`, [request_id, approver_id]
+  );
+  await client.query(`UPDATE requests SET status='APPROVED', updated_at=now() WHERE id=$1`, [request_id]);
+
+  if (!doExecute) return;
+
+  // 집행 이벤트
+  const rq = await client.query(`SELECT request_type FROM requests WHERE id=$1`, [request_id]);
+  const rtype = rq.rows[0].request_type; // DISPATCH/RETURN
+  const ev = await client.query(
+    `INSERT INTO execution_events(request_id, executed_by, event_type)
+     VALUES($1,$2,$3) RETURNING id`,
+    [request_id, approver_id, rtype]
+  );
+  const execId = ev.rows[0].id;
+
+  // 항목별 실제 재고/상태 반영
+  const items = await client.query(
+    `SELECT item_type, firearm_id, ammo_id, quantity
+     FROM request_items WHERE request_id=$1`, [request_id]
+  );
+  for (const it of items.rows) {
+    if (it.item_type==='FIREARM') {
+      const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
+      const from = fq.rows[0].status;
+      const to   = (rtype==='DISPATCH'?'불출':'불입');
+      await client.query(
+        `UPDATE firearms SET status=$1, last_change=now() WHERE id=$2`,
+        [to, it.firearm_id]
+      );
+      await client.query(
+        `INSERT INTO firearm_status_changes(execution_id, firearm_id, from_status, to_status)
+         VALUES($1,$2,$3,$4)`,
+        [execId, it.firearm_id, from, to]
+      );
+    } else if (it.item_type==='AMMO') {
+      const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`, [it.ammo_id]);
+      const before = aq.rows[0].quantity;
+      const delta  = (rtype==='DISPATCH' ? -it.quantity : +it.quantity);
+      const after  = before + delta;
+      if (after < 0) throw new Error('탄약 재고 음수 불가');
+      await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`, [after, it.ammo_id]);
+      await client.query(
+        `INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty)
+         VALUES($1,$2,$3,$4,$5)`,
+        [execId, it.ammo_id, delta, before, after]
+      );
+    }
+  }
+  await client.query(`UPDATE requests SET status='EXECUTED', updated_at=now() WHERE id=$1`, [request_id]);
+}
+
+/* Posts/Shifts 기본값 조회 */
+app.get('/api/duty/posts', async (req,res)=>{
+  const { rows } = await pool.query(`SELECT * FROM duty_posts ORDER BY id`);
+  res.json(rows);
+});
+app.get('/api/duty/shifts', async (req,res)=>{
+  const { rows } = await pool.query(`SELECT * FROM duty_shifts ORDER BY start_time`);
+  res.json(rows);
+});
+
+/* 1) 로스터 생성(+배정 등록) */
+app.post('/api/duty/rosters', async (req,res)=>{
+  try{
+    const { duty_date, created_by, auto_approve=false, auto_execute=true, notes, assignments=[] } = req.body;
+    if(!duty_date || !created_by) return res.status(400).json({error:'missing duty_date or created_by'});
+    if(!Array.isArray(assignments) || !assignments.length) return res.status(400).json({error:'no assignments'});
+
+    const result = await withTx(async(client)=>{
+      const r = await client.query(
+        `INSERT INTO duty_rosters(duty_date, status, created_by, auto_approve, auto_execute, notes)
+         VALUES($1,'DRAFT',$2,$3,$4,$5) RETURNING id`,
+        [duty_date, created_by, !!auto_approve, !!auto_execute, notes ?? null]
+      );
+      const rosterId = r.rows[0].id;
+
+      for(const a of assignments){
+        await client.query(
+          `INSERT INTO duty_assignments
+           (roster_id, post_id, shift_id, slot_no, personnel_id, firearm_id, ammo_category, ammo_qty)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [rosterId, a.post_id, a.shift_id, a.slot_no||1, a.personnel_id||null, a.firearm_id||null, a.ammo_category||null, a.ammo_qty||0]
+        );
+      }
+      return rosterId;
+    });
+    res.json({ok:true, id:result});
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
+
+/* 2) Publish: 자동 불출요청(+옵션: 자동승인/집행) & RETURN 예약 */
+app.post('/api/duty/rosters/:id/publish', async (req,res)=>{
+  try{
+    const rosterId = req.params.id;
+    const { approver_id } = req.body; // 관리자
+    await withTx(async(client)=>{
+      const roq = await client.query(`SELECT * FROM duty_rosters WHERE id=$1 FOR UPDATE`, [rosterId]);
+      if(!roq.rowCount) throw new Error('roster not found');
+      const roster = roq.rows[0];
+
+      // 상태 전환
+      if (roster.status!=='DRAFT') throw new Error('already published');
+      await client.query(`UPDATE duty_rosters SET status='PUBLISHED' WHERE id=$1`, [rosterId]);
+
+      // 불출 생성
+      const asg = await client.query(`
+        SELECT da.*, dp.requires_firearm, dp.requires_ammo, dp.default_ammo_category,
+               ds.start_time, ds.end_time
+        FROM duty_assignments da
+        JOIN duty_posts  dp ON dp.id=da.post_id
+        JOIN duty_shifts ds ON ds.id=da.shift_id
+        WHERE da.roster_id=$1
+      `,[rosterId]);
+
+      for(const a of asg.rows){
+        if(!a.personnel_id) continue; // 빈 슬롯은 스킵
+        const items = [];
+        // FIREARM(필요시)
+        if(a.requires_firearm && a.firearm_id){
+          // 현재 총기 상태 확인 및 예약 중복 검사
+          const fq = await client.query(`
+            SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`, [a.firearm_id]);
+          if(!fq.rowCount) throw new Error('firearm not found');
+          if(fq.rows[0].status!=='불입') throw new Error('불출 불가(현재 불입 아님)');
+
+          const dup = await client.query(`
+            SELECT 1
+            FROM request_items ri JOIN requests r ON r.id=ri.request_id
+            WHERE ri.item_type='FIREARM' AND ri.firearm_id=$1
+              AND r.status IN ('SUBMITTED','APPROVED')`, [a.firearm_id]);
+          if(dup.rowCount) throw new Error('해당 총기 진행중 신청 있음');
+
+          items.push({type:'FIREARM', firearm_id:a.firearm_id});
+        }
+        // AMMO(필요시)
+        if(a.requires_ammo && a.ammo_category && a.ammo_qty>0){
+          // 같은 카테고리 중 우선순위 1개 선택(간단화: 가장 재고 많은 탄약)
+          const am = await client.query(`
+            SELECT id, quantity
+            FROM ammunition
+            WHERE ammo_category=$1
+            ORDER BY quantity DESC
+            LIMIT 1
+          `,[a.ammo_category]);
+          if(!am.rowCount) throw new Error('탄약 카테고리 재고 없음');
+          const ammo = am.rows[0];
+
+          // 가용확인(예약 포함)
+          const av = await client.query(`
+            SELECT (a.quantity - COALESCE((
+              SELECT SUM(ri.quantity)
+              FROM request_items ri JOIN requests r2 ON r2.id=ri.request_id
+              WHERE ri.item_type='AMMO' AND ri.ammo_id=a.id
+                AND r2.request_type='DISPATCH'
+                AND r2.status IN ('SUBMITTED','APPROVED')
+            ),0))::int AS available
+            FROM ammunition a WHERE a.id=$1
+          `,[ammo.id]);
+          if(a.ammo_qty > av.rows[0].available) throw new Error('탄약 가용 부족');
+
+          items.push({type:'AMMO', ammo_id:ammo.id, quantity:a.ammo_qty});
+        }
+
+        if(items.length){
+          // 불출 요청 생성 (목적/장소 간단 값)
+          const reqId = await createRequestWithItems(client, {
+            requester_id: a.personnel_id,
+            type: 'DISPATCH',
+            purpose: `근무 불출(${roster.duty_date})`,
+            location: '근무지',
+            scheduled_at: `${roster.duty_date} ${a.start_time}`,
+            items
+          });
+          await client.query(
+            `INSERT INTO duty_requests(assignment_id, phase, request_id)
+             VALUES($1,'DISPATCH',$2)`, [a.id, reqId]
+          );
+
+          // 자동승인/집행
+          if(roster.auto_approve){
+            await approveAndMaybeExecute(client, {
+              request_id: reqId,
+              approver_id,
+              doExecute: roster.auto_execute
+            });
+          }
+
+          // 반납 예약(RETURN) 생성 (자동승인/집행은 complete에서 일괄 실행)
+          const retId = await createRequestWithItems(client, {
+            requester_id: a.personnel_id,
+            type: 'RETURN',
+            purpose: `근무 반납(${roster.duty_date})`,
+            location: '무기고',
+            scheduled_at: `${roster.duty_date} ${a.end_time}`,
+            items
+          });
+          await client.query(
+            `INSERT INTO duty_requests(assignment_id, phase, request_id)
+             VALUES($1,'RETURN',$2)`, [a.id, retId]
+          );
+        }
+      }
+    });
+    res.json({ok:true});
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
+
+/* 3) 완료 처리: RETURN 자동 승인/집행 */
+app.post('/api/duty/rosters/:id/complete', async (req,res)=>{
+  try{
+    const rosterId = req.params.id;
+    const { approver_id } = req.body;
+
+    await withTx(async(client)=>{
+      const roq = await client.query(`SELECT * FROM duty_rosters WHERE id=$1 FOR UPDATE`, [rosterId]);
+      if(!roq.rowCount) throw new Error('roster not found');
+      const roster = roq.rows[0];
+      if (roster.status!=='PUBLISHED' && roster.status!=='LOCKED') throw new Error('invalid status');
+
+      const rqs = await client.query(`
+        SELECT dr.request_id
+        FROM duty_requests dr
+        JOIN requests r ON r.id=dr.request_id
+        WHERE dr.phase='RETURN' AND r.status IN ('SUBMITTED','APPROVED')
+          AND dr.assignment_id IN (SELECT id FROM duty_assignments WHERE roster_id=$1)
+      `,[rosterId]);
+
+      for (const row of rqs.rows) {
+        // RETURN 승인/집행
+        await approveAndMaybeExecute(client, {
+          request_id: row.request_id,
+          approver_id,
+          doExecute: true
+        });
+      }
+
+      await client.query(`UPDATE duty_rosters SET status='COMPLETED' WHERE id=$1`, [rosterId]);
+    });
+    res.json({ok:true});
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
+
+/* 4) 서명 */
+app.post('/api/duty/assignments/:id/sign', async (req,res)=>{
+  try{
+    const id = req.params.id;
+    const { signed_by, signature_text } = req.body;
+    if(!signed_by) return res.status(400).json({error:'missing signed_by'});
+
+    const { rowCount } = await pool.query(
+      `UPDATE duty_assignments
+       SET sign_by=$1, sign_at=now(), signature=$2
+       WHERE id=$3`, [signed_by, signature_text ?? null, id]
+    );
+    if(!rowCount) return res.status(404).json({error:'not found'});
+    res.json({ok:true});
+  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+});
+
+/* 5) 조회 (일자별) */
+app.get('/api/duty/rosters', async (req,res)=>{
+  try{
+    const date = req.query.date;
+    if(!date) return res.status(400).json({error:'missing date'});
+    const ro = await pool.query(`SELECT * FROM duty_rosters WHERE duty_date=$1 ORDER BY id DESC LIMIT 1`, [date]);
+    if(!ro.rowCount) return res.json({ roster:null, assignments:[] });
+
+    const roster = ro.rows[0];
+    const asg = await pool.query(`
+      SELECT da.*, dp.name AS post_name, ds.name AS shift_name, ds.start_time, ds.end_time,
+             p.name AS person_name, p.rank AS person_rank, p.military_id AS person_military_id,
+             f.firearm_number
+      FROM duty_assignments da
+      JOIN duty_posts  dp ON dp.id=da.post_id
+      JOIN duty_shifts ds ON ds.id=da.shift_id
+      LEFT JOIN personnel p ON p.id=da.personnel_id
+      LEFT JOIN firearms f  ON f.id=da.firearm_id
+      WHERE da.roster_id=$1
+      ORDER BY dp.name, ds.start_time, da.slot_no
+    `,[roster.id]);
+
+    res.json({ roster, assignments: asg.rows });
+  }catch(e){ console.error(e); res.status(500).json({error:'query failed'}); }
+});
+
+
+
+
+
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
