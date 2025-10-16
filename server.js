@@ -608,7 +608,7 @@ app.post('/api/requests', async (req,res)=>{
       );
       const reqId = r.rows[0].id;
 
-      // 아이템 처리
+      // 1) 클라이언트가 보낸 아이템 먼저 처리 (FIREARM/AMMO)
       for(const it of items){
         if(it.type==='FIREARM'){
           // 해당 총기 행 잠금 + 중복 신청 존재 여부 체크
@@ -621,12 +621,6 @@ app.post('/api/requests', async (req,res)=>{
           if(!isAdmin && f.owner_id !== requester_id) {
             throw new Error('일반 사용자는 본인 총기만 신청할 수 있습니다');
           }
-
-          // 요청유형과 현재상태 호환성
-          if(request_type==='DISPATCH' && f.status!=='불입')
-            throw new Error(`불출 불가: 현재 상태가 '${f.status}' (불입만 가능)`);
-          if((request_type==='RETURN' || request_type==='INCOMING') && f.status!=='불출')
-            throw new Error(`불입 불가: 현재 상태가 '${f.status}' (불출만 가능)`);
 
           // 이미 제출/승인 대기 중인 신청이 있으면 차단
           const dup = await client.query(`
@@ -769,6 +763,51 @@ app.post('/api/requests', async (req,res)=>{
           );
         }else{
           throw new Error('알 수 없는 항목 타입');
+        }
+      }
+
+      // 2) ✅ 자동 탄약 추가는 "요청당 1회"만 (루프 밖)
+      const isDuty = /(근무|경계)/.test(String(purpose||''));
+      const hasAmmoAlready = (await client.query(
+        `SELECT 1 FROM request_items WHERE request_id=$1 AND item_type='AMMO' LIMIT 1`,
+        [reqId]
+      )).rowCount > 0;
+
+      if (!hasAmmoAlready && isDuty) {
+        if (request_type === 'DISPATCH') {
+          // 공포탄 5.56mm 중 재고 많은 것 1개 선택 + 가용재고 확인
+          const am = await client.query(`
+            SELECT id FROM ammunition
+            WHERE ammo_category='공포탄' AND ammo_name ILIKE '%5.56mm%'
+            ORDER BY quantity DESC LIMIT 1`);
+          if (am.rowCount) {
+            const ammoId = am.rows[0].id;
+            const av = await client.query(`
+              SELECT (a.quantity - COALESCE((
+                SELECT SUM(ri.quantity)
+                FROM request_items ri JOIN requests r2 ON r2.id=ri.request_id
+                WHERE ri.item_type='AMMO' AND ri.ammo_id=a.id
+                  AND r2.request_type='DISPATCH'
+                  AND r2.status IN ('SUBMITTED','APPROVED')
+              ),0))::int AS available
+              FROM ammunition a WHERE a.id=$1 FOR UPDATE`, [ammoId]);
+            const qty = Math.min(30, Math.max(0, av.rows[0].available|0));
+            if (qty > 0) {
+              await client.query(
+                `INSERT INTO request_items(request_id,item_type,ammo_id,quantity)
+                 VALUES($1,'AMMO',$2,$3)`, [reqId, ammoId, qty]);
+            }
+          }
+        } else if (request_type === 'RETURN' || request_type === 'INCOMING') {
+          const am = await client.query(`
+            SELECT id FROM ammunition
+            WHERE ammo_category='공포탄' AND ammo_name ILIKE '%5.56mm%'
+            ORDER BY quantity DESC LIMIT 1`);
+          if (am.rowCount) {
+            await client.query(
+              `INSERT INTO request_items(request_id,item_type,ammo_id,quantity)
+               VALUES($1,'AMMO',$2,$3)`, [reqId, am.rows[0].id, 30]);
+          }
         }
       }
 
