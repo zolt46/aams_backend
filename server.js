@@ -621,7 +621,7 @@ app.post('/api/requests', async (req,res)=>{
           // 요청유형과 현재상태 호환성
           if(request_type==='DISPATCH' && f.status!=='불입')
             throw new Error(`불출 불가: 현재 상태가 '${f.status}' (불입만 가능)`);
-          if(request_type==='RETURN' && f.status!=='불출')
+          if((request_type==='RETURN' || request_type==='INCOMING') && f.status!=='불출')
             throw new Error(`불입 불가: 현재 상태가 '${f.status}' (불출만 가능)`);
 
           // 이미 제출/승인 대기 중인 신청이 있으면 차단
@@ -683,6 +683,55 @@ app.post('/api/requests', async (req,res)=>{
             }
           }
         }
+
+        // ---------- 자동 탄약 추가: 불입(return) 처리 ----------
+        /*
+          조건:
+            - request_type 이 'RETURN' (또는 서버에서 불입을 의미하는 값) 일 것
+            - purpose 에 '근무' 또는 '경계' 가 포함될 것
+            - 요청에 이미 AMMO 항목이 없을 것
+          동작:
+            - ammunition 테이블에서 카테고리 '공포탄' & ammo_name에 '5.56mm' 포함된 품목 중
+              재고/가용 기준으로 하나 선택하여 request_items에 삽입 (qty = 기본 wantQty 또는 실제 수량)
+        */
+        if ((request_type === 'RETURN' || request_type === 'INCOMING')
+          && /(근무|경계)/.test(String(purpose||''))
+          && !items.some(x => x.type === 'AMMO')) {
+
+          // 동일한 선택 로직: 공포탄 + 5.56mm 포함 항목 중 재고 많은 것 선택
+          const am = await client.query(`
+            SELECT id, quantity
+            FROM ammunition
+            WHERE ammo_category = '공포탄'
+              AND ammo_name ILIKE '%5.56mm%'
+            ORDER BY quantity DESC
+            LIMIT 1
+          `);
+          if (am.rowCount) {
+            const ammo = am.rows[0];
+
+            // FOR UPDATE로 잠금 후, (반납이므로 재고 확인은 필수 아님 — 하지만 여전히 안전하게 현재 qty 확인)
+            const av = await client.query(`
+              SELECT a.quantity
+              FROM ammunition a
+              WHERE a.id=$1
+              FOR UPDATE
+            `,[ammo.id]);
+
+            const currentQty = (av.rowCount ? (av.rows[0].quantity|0) : (ammo.quantity|0));
+            const wantQty = 30; // 기본 반납 수량 (필요 시 변경)
+            // 반납은 재고 제한이 아니라 반납 수량으로 처리(마이너스가 아닌 양으로 처리)
+            const qty = Math.min(wantQty, Math.max(1, wantQty)); // 최소 1로 강제
+
+            // Insert as AMMO item. 마킹을 위해 ident에 '_auto_return' 표시 추가하거나 별도 컬럼이 있다면 사용
+            await client.query(
+              `INSERT INTO request_items(request_id, item_type, ammo_id, quantity, notes)
+              VALUES($1,'AMMO',$2,$3,$4)`,
+              [reqId, ammo.id, qty, '자동 반납(근무/경계)']
+            );
+          }
+        }
+
 
 
         } else if(it.type==='AMMO'){
