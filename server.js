@@ -1001,6 +1001,13 @@ app.post('/api/requests/:id/approve', async (req,res)=>{
       const r = rq.rows[0];
       if(r.status!=='SUBMITTED') return res.status(400).json({error:'not submitted'});
 
+
+      // ✅ 같은 요청의 기존 'APPROVE' 기록은 제거 → 최신 1건만 유지
+      await client.query(
+        `DELETE FROM approvals WHERE request_id=$1 AND decision='APPROVE'`,
+        [id]
+      );
+
       await client.query(`
         INSERT INTO approvals(request_id,approver_id,decision,decided_at,reason)
         VALUES($1,$2,'APPROVE',now(),NULL)
@@ -1025,6 +1032,13 @@ app.post('/api/requests/:id/reject', async (req,res)=>{
       if(!rq.rowCount) return res.status(404).json({error:'not found'});
       const r=rq.rows[0];
       if(r.status!=='SUBMITTED') return res.status(400).json({error:'not submitted'});
+
+
+      // ✅ 같은 요청의 기존 'REJECT' 기록은 제거 → 최신 1건만 유지
+      await client.query(
+        `DELETE FROM approvals WHERE request_id=$1 AND decision='REJECT'`,
+        [id]
+      );
 
       await client.query(`
         INSERT INTO approvals(request_id,approver_id,decision,decided_at,reason)
@@ -1149,9 +1163,10 @@ app.get('/api/requests/:id/timeline', async (req,res)=>{
         -- B) 승인/거부/재오픈
         UNION ALL
         SELECT a.request_id, a.decided_at, a.approver_id,
-               CASE WHEN a.decision='APPROVE' THEN 'APPROVED'
-                    WHEN a.decision='REJECT'  THEN 'REJECTED'
-                    WHEN a.decision='REOPEN'  THEN 'REOPENED' END AS event_type,
+              CASE WHEN a.decision='APPROVE' THEN 'APPROVED'
+                   WHEN a.decision='REJECT'  THEN 'REJECTED'
+                   WHEN a.decision='REOPEN'  THEN 'REOPENED'
+                   WHEN a.decision='CANCEL'  THEN 'CANCELLED' END AS event_type,
                NULL, a.reason
         FROM approvals a WHERE a.request_id=$1
 
