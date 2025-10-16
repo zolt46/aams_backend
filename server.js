@@ -903,7 +903,12 @@ app.get('/api/requests', async (req, res) => {
         if(row.status==='CANCELLED') return res.json({ok:true, status:'CANCELLED'});
 
         await client.query(`UPDATE requests SET status='CANCELLED', updated_at=now() WHERE id=$1`, [id]);
-        res.json({ok:true, status:'CANCELLED'});
+        // -- 취소도 타임라인에서 보이도록 approvals에 기록
+        await client.query(`
+          INSERT INTO approvals(request_id, approver_id, decision, decided_at, reason)
+          VALUES ($1, $2, 'CANCEL', now(), 'cancel to CANCELLED')
+        `, [id, actor_id || null]);
+        res.json({ ok:true, status:'CANCELLED' });
       });
     }catch(e){ console.error(e); res.status(500).json({error:'cancel failed'}); }
   });
@@ -1080,9 +1085,9 @@ app.post('/api/requests/:id/reopen', async (req,res)=>{
       await client.query(`UPDATE requests SET status='SUBMITTED', updated_at=now() WHERE id=$1`,[id]);
       // 간단 감사로그(원한다면 별도 audit 테이블 구성)
       await client.query(`
-        INSERT INTO approvals(request_id,approver_id,decision,reason)
-        VALUES($1,$2,'REOPEN',now(),'reopen to SUBMITTED')
-      `,[id, actor_id]);
+        INSERT INTO approvals(request_id, approver_id, decision, decided_at, reason)
+        VALUES ($1, $2, 'REOPEN', now(), 'reopen to SUBMITTED')
+      `, [id, actor_id]);
 
       res.json({ok:true});
     });
