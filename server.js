@@ -864,30 +864,41 @@ app.post('/api/requests', async (req,res)=>{
     }catch(e){ console.error(e); res.status(500).json({error:'cancel failed'}); }
   });
 
-  app.delete('/api/requests/:id', async (req,res)=>{
-  try{
-    const id = req.params.id;
-    const actor_id = req.body?.actor_id ?? req.query.actor_id ?? null;
-    await withTx(async(client)=>{
-      const r = await client.query(`SELECT requester_id, status FROM requests WHERE id=$1`, [id]);
-      if(!r.rowCount) return res.status(404).json({error:'not found'});
-      const row = r.rows[0];
+app.delete('/api/requests/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    // ★ 쿼리파라미터 우선 사용, 바디는 호환용(있으면)
+    const actorId = parseInt(req.query.actor_id || req.body?.actor_id || '0', 10);
+    if (!actorId) return res.status(400).json({ error: 'actor_id required' });
 
-      let isAdmin=false;
-      if(actor_id){
-        const u=await client.query(`SELECT is_admin FROM personnel WHERE id=$1`,[actor_id]);
-        isAdmin = !!(u.rowCount && u.rows[0].is_admin);
-      }
-      if(actor_id && row.requester_id!==actor_id && !isAdmin){
-        return res.status(403).json({error:'forbidden'});
-      }
-      if(row.status==='EXECUTED') return res.status(400).json({error:'cannot delete executed'});
+    await withTx(async (client) => {
+      // 요청 존재/상태 확인
+      const rq = await client.query(`SELECT id, requester_id, status FROM requests WHERE id=$1 FOR UPDATE`, [id]);
+      if (!rq.rowCount) return res.status(404).json({ error: 'not found' });
+      const { requester_id, status } = rq.rows[0];
 
+      // 권한: 관리자이거나, 본인 요청이면 허용
+      const u = await client.query(`SELECT is_admin FROM personnel WHERE id=$1`, [actorId]);
+      const isAdmin = !!(u.rowCount && u.rows[0].is_admin);
+      const isOwner = requester_id === actorId;
+      if (!isAdmin && !isOwner) return res.status(403).json({ error: 'forbidden' });
+
+      // 상태 제한: 집행된 건(EXECUTED)은 물리 삭제 금지 권장
+      if (status === 'EXECUTED') {
+        return res.status(400).json({ error: 'executed request cannot be deleted' });
+      }
+
+      // 여기서 실제 삭제 (자식행은 FK ON DELETE CASCADE 가정)
       await client.query(`DELETE FROM requests WHERE id=$1`, [id]);
-      res.json({ok:true, deleted:true});
+
+      res.json({ ok: true });
     });
-  }catch(e){ console.error(e); res.status(500).json({error:'delete failed'}); }
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
 });
+
 
 
 
