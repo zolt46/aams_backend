@@ -726,7 +726,7 @@ app.post('/api/requests', async (req,res)=>{
             // Insert as AMMO item. 마킹을 위해 ident에 '_auto_return' 표시 추가하거나 별도 컬럼이 있다면 사용
             await client.query(
               `INSERT INTO request_items(request_id, item_type, ammo_id, quantity)
-              VALUES($1,'AMMO',$2,$3,$4)`,
+              VALUES($1,'AMMO',$2,$3)`,
               [reqId, ammo.id, qty]
             );
           }
