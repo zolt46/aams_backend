@@ -929,13 +929,11 @@ app.delete('/api/requests/:id', async (req, res) => {
       // 권한: 관리자이거나, 본인 요청이면 허용
       const u = await client.query(`SELECT is_admin FROM personnel WHERE id=$1`, [actorId]);
       const isAdmin = !!(u.rowCount && u.rows[0].is_admin);
-      const isOwner = requester_id === actorId;
-      if (!isAdmin && !isOwner) return res.status(403).json({ error: 'forbidden' });
-
-      // 상태 제한: 집행된 건(EXECUTED)은 물리 삭제 금지 권장
-      if (status === 'EXECUTED') {
-        return res.status(400).json({ error: 'executed request cannot be deleted' });
-      }
+     // ✨ 정책 변경: 삭제는 "관리자 & REJECTED 상태"만 허용
+     if (!isAdmin) return res.status(403).json({ error: 'admin only delete' });
+     if (status !== 'REJECTED') {
+       return res.status(400).json({ error: 'only REJECTED can be deleted' });
+     }
 
       // 여기서 실제 삭제 (자식행은 FK ON DELETE CASCADE 가정)
       await client.query(`DELETE FROM requests WHERE id=$1`, [id]);
