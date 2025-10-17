@@ -949,10 +949,13 @@ app.get('/api/requests', async (req, res) => {
 
         await client.query(`UPDATE requests SET status='CANCELLED', updated_at=now() WHERE id=$1`, [id]);
         // -- 취소도 타임라인에서 보이도록 approvals에 기록 (approver_id=actor_id로 명시)
-        await client.query(`
-          INSERT INTO approvals(request_id, approver_id, decision, decided_at, reason)
-          VALUES ($1, $2, 'CANCEL', now(), 'cancel to CANCELLED')
-        `, [id, actor_id || null]);
+
+     // ✅ 취소 이력은 타임라인에 남긴다 (이미 상세에서 타임라인을 표시함)
+     // 테이블명/컬럼명은 프로젝트에 맞춰 사용(예: request_events / timeline 등)
+      await client.query(`
+         INSERT INTO request_events(request_id, event_type, event_time, actor_id, notes)
+         VALUES ($1, 'CANCELLED', now(), $2, 'cancel to CANCELLED')
+      `, [id, actor_id || null]);
         res.json({ ok:true, status:'CANCELLED' });
       });
     }catch(e){ console.error(e); res.status(500).json({error:'cancel failed'}); }
