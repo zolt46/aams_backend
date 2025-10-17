@@ -928,7 +928,7 @@ app.get('/api/requests', async (req, res) => {
         ? parseInt(req.body.actor_id, 10)
         : null;
       await withTx(async(client)=>{
-        const r = await client.query(`SELECT requester_id, status FROM requests WHERE id=$1`, [id]);
+        const r = await client.query(`SELECT requester_id, status FROM requests WHERE id=$1 FOR UPDATE`, [id]);
         if(!r.rowCount) return res.status(404).json({error:'not found'});
         const row = r.rows[0];
 
@@ -941,10 +941,14 @@ app.get('/api/requests', async (req, res) => {
           return res.status(403).json({error:'forbidden'});
         }
         if(row.status==='EXECUTED') return res.status(400).json({error:'already executed'});
+        // 👇 일반 사용자는 제출/거부에서만 취소 허용
+        if(!isAdmin && !['SUBMITTED','REJECTED'].includes(row.status)){
+          return res.status(400).json({error:'user_cancel_not_allowed'});
+        }
         if(row.status==='CANCELLED') return res.json({ok:true, status:'CANCELLED'});
 
         await client.query(`UPDATE requests SET status='CANCELLED', updated_at=now() WHERE id=$1`, [id]);
-        // -- 취소도 타임라인에서 보이도록 approvals에 기록
+        // -- 취소도 타임라인에서 보이도록 approvals에 기록 (approver_id=actor_id로 명시)
         await client.query(`
           INSERT INTO approvals(request_id, approver_id, decision, decided_at, reason)
           VALUES ($1, $2, 'CANCEL', now(), 'cancel to CANCELLED')
