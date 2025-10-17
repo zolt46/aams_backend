@@ -924,7 +924,9 @@ app.get('/api/requests', async (req, res) => {
     app.post('/api/requests/:id/cancel', async (req,res)=>{
     try{
       const id = req.params.id;
-      const actor_id = req.body?.actor_id || null;
+      const actor_id = (req.body && req.body.actor_id!=null)
+        ? parseInt(req.body.actor_id, 10)
+        : null;
       await withTx(async(client)=>{
         const r = await client.query(`SELECT requester_id, status FROM requests WHERE id=$1`, [id]);
         if(!r.rowCount) return res.status(404).json({error:'not found'});
@@ -935,7 +937,7 @@ app.get('/api/requests', async (req, res) => {
           const u=await client.query(`SELECT is_admin FROM personnel WHERE id=$1`,[actor_id]);
           isAdmin = !!(u.rowCount && u.rows[0].is_admin);
         }
-        if(actor_id && row.requester_id!==actor_id && !isAdmin){
+        if(actor_id && Number(row.requester_id)!==Number(actor_id) && !isAdmin){
           return res.status(403).json({error:'forbidden'});
         }
         if(row.status==='EXECUTED') return res.status(400).json({error:'already executed'});
