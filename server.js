@@ -1562,6 +1562,10 @@ app.listen(port, () => {
 });
 
 
+const http = require('http');
+const server = http.createServer(app);
 
+const attachBridge = require('./fingerprint_bridge');
+attachBridge(server, { wsPath: '/fp-ws' }); // 옵션 생략 가능
 
-////
+server.listen(port, () => console.log('Server listening', port));
