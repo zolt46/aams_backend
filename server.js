@@ -9,7 +9,7 @@ const path = require('path');
 
 const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, exp, used:false }
 const now = () => Date.now();
-const TICKET_TTL_MS = 10_000; // 10초
+const TICKET_TTL_MS = 1_000; // 10초
 
 
 
