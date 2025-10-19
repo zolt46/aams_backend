@@ -1562,10 +1562,46 @@ app.listen(port, () => {
 });
 
 
-const http = require('http');
-const server = http.createServer(app);
+// ===== Fingerprint Ingress =====
+// 1) 로컬 브릿지가 이벤트를 밀어넣는 엔드포인트
+app.post('/api/fp/event', async (req, res) => {
+  try {
+    const token = req.get('x-fp-token');
+    if (token !== process.env.FP_SITE_TOKEN) return res.status(401).json({ ok:false, error:'unauthorized' });
 
-const attachBridge = require('./fingerprint_bridge');
-attachBridge(server, { wsPath: '/fp-ws' }); // 옵션 생략 가능
+    const { site = 'default', data } = req.body || {};
+    if (!data) return res.status(400).json({ ok:false, error:'missing data' });
 
-server.listen(port, () => console.log('Server listening', port));
+    // 메모리 브로드캐스트 (사이트별)
+    const listeners = (globalThis.__FP_SSE__ ||= new Map());
+    const set = listeners.get(site);
+    if (set) {
+      const payload = JSON.stringify({ ...data, _ts: new Date().toISOString() });
+      for (const res of set) res.write(`data: ${payload}\n\n`);
+    }
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error('fp/event error', e);
+    res.status(500).json({ ok:false, error:String(e.message||e) });
+  }
+});
+
+// 2) UI가 구독하는 SSE 스트림(사이트별 채널)
+app.get('/api/fp/stream/:site', (req, res) => {
+  const site = req.params.site || 'default';
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
+  res.flushHeaders();
+  res.write('retry: 1000\n\n');
+
+  const listeners = (globalThis.__FP_SSE__ ||= new Map());
+  if (!listeners.has(site)) listeners.set(site, new Set());
+  listeners.get(site).add(res);
+
+  req.on('close', () => {
+    const set = listeners.get(site);
+    if (set) set.delete(res);
+  });
+});
+
