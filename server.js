@@ -1561,47 +1561,105 @@ app.listen(port, () => {
 
 
 // 로컬 브릿지 → Render (지문 이벤트 적재)
+// server.js 하단에 추가/완성
+const sseClients = new Map(); // site -> Set(res)
+const lastEvent  = new Map(); // site -> last json
+
+function pushToSse(site, payload){
+  const set = sseClients.get(site);
+  if (!set) return;
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of set) { try { res.write(data); } catch(_){} }
+}
+
 app.post('/api/fp/event', async (req, res) => {
   try {
     const token = req.get('x-fp-token');
-    if (token !== process.env.FP_SITE_TOKEN)
+    if (token !== process.env.FP_SITE_TOKEN) {
       return res.status(401).json({ ok:false, error:'unauthorized' });
-
+    }
     const { site = 'default', data } = req.body || {};
     if (!data) return res.status(400).json({ ok:false, error:'missing data' });
 
-    // 사이트별 SSE 구독자에게 바로 push
-    const listeners = (globalThis.__FP_SSE__ ||= new Map());
-    const set = listeners.get(site);
-    if (set && set.size) {
-      const payload = JSON.stringify({ ...data, _ts: new Date().toISOString() });
-      for (const sseRes of set) sseRes.write(`data: ${payload}\n\n`);
+    // 매핑 해석 (identify 성공시에만)
+    let resolved = null;
+    if (data.ok === true && data.type === 'identify' && Number.isInteger(data.matchId)) {
+      const q = `SELECT t.person_id, p.name, p.is_admin
+                 FROM fp_templates t JOIN personnel p ON p.id=t.person_id
+                 WHERE t.sensor_id=$1 AND t.site=$2 LIMIT 1`;
+      const r = await pool.query(q, [data.matchId, site]);
+      if (r.rowCount) {
+        const row = r.rows[0];
+        resolved = { person_id: row.person_id, name: row.name, is_admin: !!row.is_admin };
+      }
     }
-    res.json({ ok:true });
+
+    const payload = { site, data, resolved, received_at: new Date().toISOString() };
+    lastEvent.set(site, payload);
+    pushToSse(site, payload);
+
+    return res.json({ ok:true });
   } catch (e) {
-    console.error('fp/event error', e);
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    console.error('fp/event error:', e);
+    res.status(500).json({ ok:false, error:'fp_event_failed' });
   }
 });
 
 
+
 // UI ← Render (SSE 실시간 스트림)
-app.get('/api/fp/stream/:site', (req, res) => {
-  const site = req.params.site || 'default';
-  res.setHeader('Content-Type','text/event-stream');
-  res.setHeader('Cache-Control','no-cache');
-  res.setHeader('Connection','keep-alive');
-  res.flushHeaders();
-  res.write('retry: 1000\n\n'); // 끊기면 1초 후 재접속
+// SSE 스트림: /api/fp/stream?site=site-01
+app.get('/api/fp/stream', (req, res) => {
+  const site = (req.query.site || 'default');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
 
-  const listeners = (globalThis.__FP_SSE__ ||= new Map());
-  if (!listeners.has(site)) listeners.set(site, new Set());
-  listeners.get(site).add(res);
+  if (!sseClients.has(site)) sseClients.set(site, new Set());
+  const set = sseClients.get(site);
+  set.add(res);
 
-  req.on('close', () => {
-    const set = listeners.get(site);
-    if (set) set.delete(res);
-  });
+  // 최근 이벤트 1건 즉시 전달(있으면)
+  const last = lastEvent.get(site);
+  if (last) res.write(`data: ${JSON.stringify(last)}\n\n`);
+
+  req.on('close', () => { try { set.delete(res); } catch(_){} });
 });
+
+// 최근 1건 폴링 용(테스트/디버깅)
+app.get('/api/fp/last', (req, res) => {
+  const site = (req.query.site || 'default');
+  res.json(lastEvent.get(site) || null);
+});
+
+
+// 매핑 등록: sensor_id ↔ person_id
+app.post('/api/fp/map', async (req, res) => {
+  const { sensor_id, person_id, site='default' } = req.body || {};
+  if (!Number.isInteger(sensor_id) || !Number.isInteger(person_id)) {
+    return res.status(400).json({ error:'bad sensor_id or person_id' });
+  }
+  try{
+    await pool.query(
+      `INSERT INTO fp_templates(sensor_id, person_id, site)
+       VALUES($1,$2,$3)
+       ON CONFLICT (sensor_id) DO UPDATE SET person_id=EXCLUDED.person_id, site=EXCLUDED.site`,
+      [sensor_id, person_id, site]
+    );
+    res.json({ ok:true });
+  }catch(e){ console.error(e); res.status(500).json({ error:'map_upsert_failed' }); }
+});
+
+// 매핑 조회(관리툴에서 볼 때)
+app.get('/api/fp/map', async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT t.sensor_id, t.site, t.person_id, p.name, p.is_admin
+     FROM fp_templates t LEFT JOIN personnel p ON p.id=t.person_id
+     ORDER BY t.sensor_id`
+  );
+  res.json(rows);
+});
+
 
 
