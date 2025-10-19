@@ -1601,7 +1601,8 @@ app.post('/api/fp/event', async (req, res) => {
             name: resolved.name,
             is_admin: !!resolved.is_admin,
             exp: now() + TICKET_TTL_MS,
-            used: false
+            used: false,
+            issued_at: now()
           });
         }
       }
@@ -1686,8 +1687,20 @@ app.get('/api/fp/ticket', (req,res)=>{
 // 2) 티켓 소비(원샷) – UI는 이걸 먼저 때림
 app.post('/api/fp/claim', (req,res)=>{
   const site = (req.body && req.body.site) || 'default';
+  const after = Number(req.body?.after || 0);
   const t = loginTickets.get(site);
   if (!t || t.used || t.exp < now()) return res.json({ ok:false });
+  if (after && !(t.issued_at > after)) {
+   // 로그아웃 이전/동일 시각에 발급된 티켓은 허용하지 않음
+   return res.json({ ok:false });
+ }
+
   t.used = true; // 원샷 소모
   res.json({ ok:true, person_id:t.person_id, name:t.name, is_admin:t.is_admin });
+});
+
+app.post('/api/fp/invalidate', (req,res)=>{
+  const site = (req.body && req.body.site) || 'default';
+  loginTickets.delete(site);
+  res.json({ ok:true });
 });
