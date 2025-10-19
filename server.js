@@ -1625,6 +1625,7 @@ app.post('/api/fp/event', async (req, res) => {
 // SSE 스트림: /api/fp/stream?site=site-01
 app.get('/api/fp/stream', (req, res) => {
   const site = (req.query.site || 'default');
+  const since = Number(req.query.since || 0); // 로그아웃 시각(ms) 이후만 허용
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -1635,8 +1636,14 @@ app.get('/api/fp/stream', (req, res) => {
   set.add(res);
 
   // 최근 이벤트 1건 즉시 전달(있으면)
-  const last = lastEvent.get(site);
-  if (last) res.write(`data: ${JSON.stringify(last)}\n\n`);
+ const last = lastEvent.get(site);
+ if (last) {
+   const ts = Date.parse(last.received_at || '') || 0;
+   if (!since || ts > since) {
+     // 오직 'since' 이후의 이벤트만 초기 1건으로 전송
+     res.write(`data: ${JSON.stringify(last)}\n\n`);
+   }
+ }
 
   req.on('close', () => { try { set.delete(res); } catch(_){} });
 });
