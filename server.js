@@ -7,6 +7,10 @@ const app = express();
 const port = process.env.PORT || 3000;
 const path = require('path');
 
+const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, exp, used:false }
+const now = () => Date.now();
+const TICKET_TTL_MS = 10_000; // 10초
+
 
 
 app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
@@ -1591,6 +1595,15 @@ app.post('/api/fp/event', async (req, res) => {
       if (r.rowCount) {
         const row = r.rows[0];
         resolved = { person_id: row.person_id, name: row.name, is_admin: !!row.is_admin };
+        if (data.ok === true && data.type === 'identify' && resolved?.person_id) {
+          loginTickets.set(site, {
+            person_id: resolved.person_id,
+            name: resolved.name,
+            is_admin: !!resolved.is_admin,
+            exp: now() + TICKET_TTL_MS,
+            used: false
+          });
+        }
       }
     }
 
@@ -1662,4 +1675,19 @@ app.get('/api/fp/map', async (req, res) => {
 });
 
 
+// 1) 티켓 상태 확인(사용하지 않음) – 선택
+app.get('/api/fp/ticket', (req,res)=>{
+  const site = req.query.site || 'default';
+  const t = loginTickets.get(site);
+  if (!t || t.used || t.exp < now()) return res.json({ ok:false });
+  res.json({ ok:true, person_id:t.person_id, name:t.name, is_admin:t.is_admin, exp:t.exp });
+});
 
+// 2) 티켓 소비(원샷) – UI는 이걸 먼저 때림
+app.post('/api/fp/claim', (req,res)=>{
+  const site = (req.body && req.body.site) || 'default';
+  const t = loginTickets.get(site);
+  if (!t || t.used || t.exp < now()) return res.json({ ok:false });
+  t.used = true; // 원샷 소모
+  res.json({ ok:true, person_id:t.person_id, name:t.name, is_admin:t.is_admin });
+});
