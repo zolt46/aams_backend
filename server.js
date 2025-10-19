@@ -1626,19 +1626,27 @@ app.post('/api/fp/event', async (req, res) => {
 app.get('/api/fp/stream', (req, res) => {
   const site = (req.query.site || 'default');
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
   if (!sseClients.has(site)) sseClients.set(site, new Set());
   const set = sseClients.get(site);
   set.add(res);
 
+  // 🔴 초기 lastEvent 1건 밀어주던 코드를 완전히 제거했습니다.
 
-  const hb = setInterval(()=>{ try{ res.write(':\n\n'); }catch(_){} }, 30000);
-  req.on('close', () => { clearInterval(hb); try { set.delete(res); } catch(_){ } });
+  // heartbeat
+  const hb = setInterval(() => { try { res.write(':\n\n'); } catch (_) {} }, 30000);
+
+  req.on('close', () => {
+    clearInterval(hb);
+    try { set.delete(res); } catch (_){}
+  });
 });
+
 
 // 최근 1건 폴링 용(테스트/디버깅)
 app.get('/api/fp/last', (req, res) => {
