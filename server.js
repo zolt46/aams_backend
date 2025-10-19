@@ -7,6 +7,8 @@ const app = express();
 const port = process.env.PORT || 3000;
 const path = require('path');
 
+
+
 app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
 
 // CORS 설정: 모든 도메인에서의 요청을 허용
@@ -1553,47 +1555,44 @@ app.get('/api/duty/rosters', async (req,res)=>{
 });
 
 
-
-
-
-
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
 
 
-// ===== Fingerprint Ingress =====
-// 1) 로컬 브릿지가 이벤트를 밀어넣는 엔드포인트
+// 로컬 브릿지 → Render (지문 이벤트 적재)
 app.post('/api/fp/event', async (req, res) => {
   try {
     const token = req.get('x-fp-token');
-    if (token !== process.env.FP_SITE_TOKEN) return res.status(401).json({ ok:false, error:'unauthorized' });
+    if (token !== process.env.FP_SITE_TOKEN)
+      return res.status(401).json({ ok:false, error:'unauthorized' });
 
     const { site = 'default', data } = req.body || {};
     if (!data) return res.status(400).json({ ok:false, error:'missing data' });
 
-    // 메모리 브로드캐스트 (사이트별)
+    // 사이트별 SSE 구독자에게 바로 push
     const listeners = (globalThis.__FP_SSE__ ||= new Map());
     const set = listeners.get(site);
-    if (set) {
+    if (set && set.size) {
       const payload = JSON.stringify({ ...data, _ts: new Date().toISOString() });
-      for (const res of set) res.write(`data: ${payload}\n\n`);
+      for (const sseRes of set) sseRes.write(`data: ${payload}\n\n`);
     }
-    return res.json({ ok:true });
+    res.json({ ok:true });
   } catch (e) {
     console.error('fp/event error', e);
     res.status(500).json({ ok:false, error:String(e.message||e) });
   }
 });
 
-// 2) UI가 구독하는 SSE 스트림(사이트별 채널)
+
+// UI ← Render (SSE 실시간 스트림)
 app.get('/api/fp/stream/:site', (req, res) => {
   const site = req.params.site || 'default';
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
   res.flushHeaders();
-  res.write('retry: 1000\n\n');
+  res.write('retry: 1000\n\n'); // 끊기면 1초 후 재접속
 
   const listeners = (globalThis.__FP_SSE__ ||= new Map());
   if (!listeners.has(site)) listeners.set(site, new Set());
@@ -1604,4 +1603,5 @@ app.get('/api/fp/stream/:site', (req, res) => {
     if (set) set.delete(res);
   });
 });
+
 
