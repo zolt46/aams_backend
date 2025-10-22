@@ -11,6 +11,33 @@ const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, 
 const now = () => Date.now();
 const TICKET_TTL_MS = 1_000; // 10초
 
+const fetchFallback = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+async function fetchWithFallback(url, options) {
+  if (typeof fetch === 'function') {
+    return fetch(url, options);
+  }
+  return fetchFallback(url, options);
+}
+
+function httpError(status, message) {
+  const err = new Error(message);
+  err.statusCode = status;
+  return err;
+}
+
+function toJsonNotes(obj) {
+  if (!obj) return null;
+  try { return JSON.stringify(obj); }
+  catch { return null; }
+}
+
+function trimSlash(value = '') {
+  return value ? String(value).replace(/\/+$/, '') : '';
+}
+
+const LOCAL_BRIDGE_URL = trimSlash(process.env.LOCAL_BRIDGE_URL || process.env.ROBOT_BRIDGE_URL || process.env.FP_LOCAL_BRIDGE_URL || '');
+const LOCAL_BRIDGE_TOKEN = process.env.LOCAL_BRIDGE_TOKEN || process.env.ROBOT_BRIDGE_TOKEN || '';
+const ROBOT_EVENT_TOKEN = process.env.ROBOT_SITE_TOKEN || process.env.FP_SITE_TOKEN || '';
 
 
 app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
@@ -584,6 +611,168 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     }
   }
 
+  async function finalizeRequestExecution(client, requestRow, executedBy, { notes = null } = {}) {
+    const id = requestRow.id;
+    const eventType = requestRow.request_type || requestRow.type || 'EXECUTION';
+    const ev = await client.query(
+      `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
+       VALUES($1,$2,$3,$4) RETURNING id`,
+      [id, executedBy, eventType, notes]
+    );
+    const execId = ev.rows[0].id;
+
+    const items = await client.query(
+      `SELECT item_type, firearm_id, ammo_id, quantity
+       FROM request_items WHERE request_id=$1`,
+      [id]
+    );
+
+    for (const it of items.rows) {
+      if (it.item_type === 'FIREARM') {
+        const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
+        if (!fq.rowCount) throw new Error('총기 없음');
+        const from = fq.rows[0].status;
+        const to = (requestRow.request_type === 'DISPATCH' ? '불출' : '불입');
+        await client.query(`UPDATE firearms SET status=$1, last_change=now() WHERE id=$2`, [to, it.firearm_id]);
+        await client.query(
+          `INSERT INTO firearm_status_changes(execution_id, firearm_id, from_status, to_status)
+           VALUES($1,$2,$3,$4)`,
+          [execId, it.firearm_id, from, to]
+        );
+      } else if (it.item_type === 'AMMO') {
+        const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`, [it.ammo_id]);
+        if (!aq.rowCount) throw new Error('탄약 없음');
+        const before = aq.rows[0].quantity;
+        const delta = (requestRow.request_type === 'DISPATCH' ? -it.quantity : +it.quantity);
+        const after = before + delta;
+        if (after < 0) throw new Error('탄약 재고 음수 불가');
+        await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`, [after, it.ammo_id]);
+        await client.query(
+          `INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty)
+           VALUES($1,$2,$3,$4,$5)`,
+          [execId, it.ammo_id, delta, before, after]
+        );
+      }
+    }
+
+    await client.query(`UPDATE requests SET status='EXECUTED', status_reason=NULL, updated_at=now() WHERE id=$1`, [id]);
+    return { eventId: execId };
+  }
+
+  function buildRobotDispatchPayload({ request, executor, executedBy, dispatch, eventId }) {
+    const mode = dispatch?.mode
+      || (request.request_type === 'DISPATCH' ? 'dispatch'
+        : (request.request_type === 'RETURN' ? 'return' : 'auto'));
+    return {
+      requestId: request.id,
+      executionEventId: eventId,
+      executedBy: executedBy || null,
+      executor: executor || null,
+      dispatch: dispatch || null,
+      type: request.request_type,
+      mode,
+      site: dispatch?.site_id || request.site_id || request.site || null,
+      status: request.status,
+      purpose: request.purpose || null,
+      location: request.location || null,
+      requestedAt: request.requested_at || request.created_at || null,
+      approvedAt: request.approved_at || null
+    };
+  }
+
+  async function sendRobotDispatch(payload) {
+    if (!LOCAL_BRIDGE_URL) {
+      return { ok: false, skipped: true, error: 'bridge_unconfigured' };
+    }
+    const url = `${LOCAL_BRIDGE_URL}/robot/execute`;
+    try {
+      const headers = { 'content-type': 'application/json' };
+      if (LOCAL_BRIDGE_TOKEN) headers['x-bridge-token'] = LOCAL_BRIDGE_TOKEN;
+      const res = await fetchWithFallback(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload)
+      });
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!res.ok || (data && data.ok === false)) {
+        return { ok: false, status: res.status, data, error: data?.error || data?.message || `HTTP ${res.status}` };
+      }
+      return { ok: true, data };
+    } catch (err) {
+      return { ok: false, error: err.message || String(err) };
+    }
+  }
+
+  async function handleRobotEvent({ requestId, status, job, site }) {
+    const normalized = String(status || job?.status || '').toLowerCase();
+    const eventId = job?.eventId || job?.executionEventId || job?.execution_event_id || null;
+    const message = job?.message || '';
+    const stage = job?.stage || '';
+    const notesPayload = toJsonNotes({ stage: normalized, job, site });
+
+    if (!normalized) {
+      return;
+    }
+
+    if (normalized === 'accepted' || normalized === 'queued' || normalized === 'dispatched') {
+      await withTx(async (client) => {
+        await client.query(`UPDATE requests SET status='DISPATCHED', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, message || '장비 명령 대기 중']);
+        if (eventId) {
+          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
+        }
+      });
+      return;
+    }
+
+    if (normalized === 'progress' || normalized === 'executing' || normalized === 'running') {
+      await withTx(async (client) => {
+        await client.query(`UPDATE requests SET status='EXECUTING', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, message || stage || '장비 동작 중']);
+        if (eventId) {
+          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
+        }
+      });
+      return;
+    }
+
+    if (normalized === 'success' || normalized === 'succeeded' || normalized === 'completed') {
+      await withTx(async (client) => {
+        const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [requestId]);
+        if (!rq.rowCount) throw httpError(404, 'request_not_found');
+        const requestRow = rq.rows[0];
+        if (requestRow.status === 'EXECUTED') {
+          if (eventId) {
+            await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
+          }
+          return;
+        }
+        const execReq = await client.query(`SELECT id, executed_by FROM execution_events WHERE request_id=$1 AND event_type='EXECUTION_REQUEST' ORDER BY executed_at DESC LIMIT 1`, [requestId]);
+        const executedBy = job?.executedBy || job?.executorId || (execReq.rowCount ? execReq.rows[0].executed_by : null);
+        const completionNotes = toJsonNotes({ stage: 'completed', job, site });
+        await finalizeRequestExecution(client, requestRow, executedBy, { notes: completionNotes });
+        if (eventId) {
+          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, eventId]);
+        }
+        if (execReq.rowCount && (!eventId || eventId !== execReq.rows[0].id)) {
+          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, execReq.rows[0].id]);
+        }
+      });
+      return;
+    }
+
+    if (normalized === 'error' || normalized === 'failed' || normalized === 'timeout') {
+      const reason = message || stage || '장비 오류';
+      await withTx(async (client) => {
+        await client.query(`UPDATE requests SET status='EXECUTION_FAILED', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, reason]);
+        if (eventId) {
+          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
+        }
+      });
+      return;
+    }
+  }
+
+
   // 1) 신청 생성
 // 1) 신청 생성 (원자성 + 서버측 필수검증)
 app.post('/api/requests', async (req,res)=>{
@@ -1061,66 +1250,85 @@ app.post('/api/requests/:id/reject', async (req,res)=>{
 });
 
 
-// 집행: 이 시점에만 총기 상태/탄약 수량을 실제로 반영
+// 집행: 장비 제어가 연결되어 있으면 로컬 브릿지로 위임, 아니면 즉시 반영
 app.post('/api/requests/:id/execute', async (req,res)=>{
-  try{
-    const id = req.params.id;
-    const executed_by = req.body?.executed_by || null;
+  const id = parseInt(req.params.id, 10);
+  const executed_by = req.body?.executed_by || null;
+  const dispatchPayload = req.body?.dispatch || null;
 
-    await withTx(async(client)=>{
-      const rq=await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`,[id]);
-      if(!rq.rowCount) return res.status(404).json({error:'not found'});
-      const r=rq.rows[0];
-      if(r.status!=='APPROVED') return res.status(400).json({error:'not approved'});
+  try {
+    if (!LOCAL_BRIDGE_URL) {
+      const result = await withTx(async (client) => {
+        const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [id]);
+        if (!rq.rowCount) throw httpError(404, 'not found');
+        const requestRow = rq.rows[0];
+        if (requestRow.status !== 'APPROVED') throw httpError(400, 'not approved');
+        await finalizeRequestExecution(client, requestRow, executed_by, {
+          notes: toJsonNotes({ stage: 'immediate', dispatch: dispatchPayload })
+        });
+        return { request: requestRow };
+      });
+      return res.json({ ok: true, status: 'EXECUTED', mode: 'immediate', request_id: id, request_type: result.request.request_type });
+    }
 
-      // 집행 이벤트 생성
+    const queued = await withTx(async (client) => {
+      const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [id]);
+      if (!rq.rowCount) throw httpError(404, 'not found');
+      const requestRow = rq.rows[0];
+      if (requestRow.status !== 'APPROVED') throw httpError(400, 'not approved');
+
+      await client.query(`UPDATE requests SET status='DISPATCH_PENDING', status_reason='장비 명령 준비 중', updated_at=now() WHERE id=$1`, [id]);
       const ev = await client.query(
         `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
          VALUES($1,$2,$3,$4) RETURNING id`,
-        [id, executed_by, r.request_type, 'EXECUTE: inventory committed at execution']
-      );
-      const execId = ev.rows[0].id;
-
-      // 요청 항목 조회
-      const items = await client.query(
-        `SELECT item_type, firearm_id, ammo_id, quantity
-         FROM request_items WHERE request_id=$1`,
-        [id]
+        [id, executed_by, 'EXECUTION_REQUEST', toJsonNotes({ stage: 'queued', dispatch: dispatchPayload })]
       );
 
-      // 총기/탄약 반영
-      for (const it of items.rows) {
-        if (it.item_type==='FIREARM') {
-          const fq = await client.query(`SELECT id,status FROM firearms WHERE id=$1 FOR UPDATE`, [it.firearm_id]);
-          if(!fq.rowCount) throw new Error('총기 없음');
-          const from = fq.rows[0].status;
-          const to   = (r.request_type==='DISPATCH' ? '불출' : '불입');
-          await client.query(`UPDATE firearms SET status=$1, last_change=now() WHERE id=$2`, [to, it.firearm_id]);
-          await client.query(
-            `INSERT INTO firearm_status_changes(execution_id, firearm_id, from_status, to_status)
-             VALUES($1,$2,$3,$4)`,
-            [execId, it.firearm_id, from, to]
-          );
-        } else if (it.item_type==='AMMO') {
-          const aq = await client.query(`SELECT id, quantity FROM ammunition WHERE id=$1 FOR UPDATE`, [it.ammo_id]);
-          if(!aq.rowCount) throw new Error('탄약 없음');
-          const before = aq.rows[0].quantity;
-          const delta  = (r.request_type==='DISPATCH' ? -it.quantity : +it.quantity);
-          const after  = before + delta;
-          if (after < 0) throw new Error('탄약 재고 음수 불가');
-          await client.query(`UPDATE ammunition SET quantity=$1, last_change=now() WHERE id=$2`, [after, it.ammo_id]);
-          await client.query(
-            `INSERT INTO ammo_movements(execution_id, ammo_id, delta, before_qty, after_qty)
-             VALUES($1,$2,$3,$4,$5)`,
-            [execId, it.ammo_id, delta, before, after]
-          );
-        }
+      let executor = null;
+      if (executed_by) {
+        const ex = await client.query(`SELECT id, name, rank, unit, position FROM personnel WHERE id=$1`, [executed_by]);
+        executor = ex.rowCount ? ex.rows[0] : null;
       }
-
-      await client.query(`UPDATE requests SET status='EXECUTED', updated_at=now() WHERE id=$1`, [id]);
-      res.json({ok:true});
+      return { request: requestRow, eventId: ev.rows[0].id, executor };
     });
-  }catch(e){ console.error(e); res.status(400).json({error:String(e.message||e)}); }
+
+    const payload = buildRobotDispatchPayload({
+      request: queued.request,
+      executor: queued.executor,
+      executedBy: executed_by,
+      dispatch: dispatchPayload,
+      eventId: queued.eventId
+    });
+
+    const dispatchResult = await sendRobotDispatch(payload);
+
+    if (!dispatchResult.ok) {
+      const reason = dispatchResult.error || 'local_dispatch_failed';
+      await withTx(async (client) => {
+        await client.query(`UPDATE requests SET status='DISPATCH_FAILED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, reason]);
+        await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
+          toJsonNotes({ stage: 'failed', reason, dispatch: dispatchPayload }),
+          queued.eventId
+        ]);
+      });
+      throw httpError(502, reason);
+    }
+
+    const job = dispatchResult.data?.job || null;
+    await withTx(async (client) => {
+      await client.query(`UPDATE requests SET status='DISPATCHED', status_reason='장비 명령 대기 중', updated_at=now() WHERE id=$1`, [id]);
+      await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
+        toJsonNotes({ stage: 'dispatched', dispatch: dispatchPayload, job }),
+        queued.eventId
+      ]);
+    });
+
+    return res.json({ ok: true, status: 'DISPATCHED', job, request_id: id });
+  } catch (e) {
+    const status = e?.statusCode || 500;
+    console.error('execute error:', e);
+    return res.status(status).json({ ok: false, error: e.message || 'execute_failed' });
+  }
 });
 
 
@@ -1558,9 +1766,29 @@ app.get('/api/duty/rosters', async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).json({error:'query failed'}); }
 });
 
-
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
+});
+
+app.post('/api/robot/event', async (req, res) => {
+  try {
+    const token = req.get('x-robot-token') || req.get('x-fp-token');
+    if (ROBOT_EVENT_TOKEN) {
+      if (!token || token !== ROBOT_EVENT_TOKEN) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+      }
+    }
+    const { job = {}, site = 'default', status } = req.body || {};
+    const requestId = job?.requestId || job?.request_id;
+    const effectiveStatus = status || job?.status;
+    if (!requestId) return res.status(400).json({ ok: false, error: 'missing requestId' });
+    if (!effectiveStatus) return res.status(400).json({ ok: false, error: 'missing status' });
+    await handleRobotEvent({ requestId, status: effectiveStatus, job, site });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('robot event error:', e);
+    res.status(500).json({ ok: false, error: e.message || 'robot_event_failed' });
+  }
 });
 
 
