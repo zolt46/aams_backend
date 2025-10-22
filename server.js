@@ -54,6 +54,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+async function ensureDatabaseColumns() {
+  const statements = [
+    `ALTER TABLE requests ADD COLUMN IF NOT EXISTS status_reason TEXT`
+  ];
+  for (const sql of statements) {
+    try {
+      await pool.query(sql);
+    } catch (err) {
+      console.error('[schema] ensure failed:', sql, err.message || err);
+    }
+  }
+}
+
+const schemaReady = ensureDatabaseColumns();
+
 // 헬스체크
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -597,6 +612,7 @@ app.delete('/api/ammunition/:id', async (req, res) => {
 
   // 트랜잭션 헬퍼
   async function withTx(run){
+    await schemaReady;
     const client = await pool.connect();
     try{
       await client.query('BEGIN');
