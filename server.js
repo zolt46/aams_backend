@@ -68,6 +68,8 @@ function trimSlash(value = '') {
 const LOCAL_BRIDGE_URL = trimSlash(process.env.LOCAL_BRIDGE_URL || process.env.ROBOT_BRIDGE_URL || process.env.FP_LOCAL_BRIDGE_URL || '');
 const LOCAL_BRIDGE_TOKEN = process.env.LOCAL_BRIDGE_TOKEN || process.env.ROBOT_BRIDGE_TOKEN || '';
 const ROBOT_EVENT_TOKEN = process.env.ROBOT_SITE_TOKEN || process.env.FP_SITE_TOKEN || '';
+const PUBLIC_API_BASE = trimSlash(process.env.PUBLIC_API_BASE || process.env.ROBOT_EVENT_BASE || '');
+const DEFAULT_ROBOT_EVENT_URL = trimSlash(process.env.ROBOT_EVENT_URL || (PUBLIC_API_BASE ? `${PUBLIC_API_BASE}/api/robot/event` : ''));
 
 async function fetchLocalBridge(pathname, options = {}, { timeoutMs = 5000 } = {}) {
   if (!LOCAL_BRIDGE_URL) {
@@ -808,10 +810,16 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       }) : undefined
     })));
 
-    return { dispatch: mergedDispatch, items: itemsPayload };
+    const forward = pruneEmpty({
+      url: DEFAULT_ROBOT_EVENT_URL || null,
+      token: ROBOT_EVENT_TOKEN || null,
+      site: requestRow.site_id || requestRow.site || null
+    });
+
+    return { dispatch: mergedDispatch, items: itemsPayload, forward };
   }
 
-  function buildRobotDispatchPayload({ request, executor, executedBy, dispatch, eventId, items }) {
+  function buildRobotDispatchPayload({ request, executor, executedBy, dispatch, eventId, items, forward }) {
     const requestSummary = pruneEmpty({
       id: request.id,
       requester_id: request.requester_id,
@@ -826,6 +834,17 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       approved_at: request.approved_at || null
     });
 
+        const forwardDefault = pruneEmpty({
+      url: DEFAULT_ROBOT_EVENT_URL || null,
+      token: ROBOT_EVENT_TOKEN || null,
+      site: request.site_id || request.site || null
+    });
+
+    const forwardConfig = pruneEmpty({
+      ...(forwardDefault || {}),
+      ...(forward || {})
+    });
+
     return pruneEmpty({
       requestId: request.id,
       executionEventId: eventId,
@@ -838,7 +857,8 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       mode: dispatch?.mode || null,
       site: dispatch?.site_id || request.site_id || request.site || null,
       status: request.status || null,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      forward: forwardConfig
     });
   }
 
@@ -1512,7 +1532,7 @@ app.post('/api/requests/:id/execute', async (req, res) => {
         throw httpError(400, 'not approved');
       }
 
-      const { dispatch, items } = await buildDispatchPayloadFromDb(client, requestRow, dispatchPayload);
+      const { dispatch, items, forward } = await buildDispatchPayloadFromDb(client, requestRow, dispatchPayload);
       if (!dispatch) {
         throw httpError(400, '장비 제어 데이터가 부족합니다');
       }
@@ -1531,7 +1551,7 @@ app.post('/api/requests/:id/execute', async (req, res) => {
         const ex = await client.query(`SELECT id, name, rank, unit, position FROM personnel WHERE id=$1`, [executed_by]);
         executor = ex.rowCount ? ex.rows[0] : null;
       }
-      return { request: requestRow, eventId: ev.rows[0].id, executor, dispatch, items };
+      return { request: requestRow, eventId: ev.rows[0].id, executor, dispatch, items, forward };
     });
 
     const payload = buildRobotDispatchPayload({
@@ -1540,7 +1560,8 @@ app.post('/api/requests/:id/execute', async (req, res) => {
       executedBy: executed_by,
       dispatch: queued.dispatch,
       eventId: queued.eventId,
-      items: queued.items
+      items: queued.items,
+      forward: queued.forward
     });
 
         let manualRequired = true;
@@ -1614,6 +1635,72 @@ app.post('/api/requests/:id/execute', async (req, res) => {
     const status = e?.statusCode || 500;
     console.error('execute error:', e);
     return res.status(status).json({ ok: false, error: e.message || 'execute_failed' });
+  }
+});
+
+app.post('/api/requests/:id/execute_complete', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const actorId = req.body?.actor_id || null;
+  const eventId = req.body?.event_id || null;
+  const result = req.body?.result || null;
+  const statusReasonRaw = req.body?.status_reason;
+
+  try {
+    const completion = await withTx(async (client) => {
+      const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [id]);
+      if (!rq.rowCount) throw httpError(404, 'not found');
+      const requestRow = rq.rows[0];
+
+      if (requestRow.status === 'EXECUTED') {
+        return { already: true, request: requestRow, statusReason: requestRow.status_reason || null };
+      }
+
+      if (String(requestRow.status || '').toUpperCase() !== 'APPROVED') {
+        throw httpError(400, 'not approved');
+      }
+
+      const reason = (typeof statusReasonRaw === 'string' && statusReasonRaw.trim())
+        ? statusReasonRaw.trim()
+        : (result?.message
+          || (result?.summary?.actionLabel ? `${result.summary.actionLabel} 완료` : '장비 제어가 정상적으로 완료되었습니다.'));
+
+      let safeResult = result;
+      if (result && typeof result === 'object') {
+        try {
+          safeResult = JSON.parse(JSON.stringify(result));
+          if (safeResult?.payload?.forward) {
+            delete safeResult.payload.forward.token;
+          }
+          if (safeResult?.forward) {
+            delete safeResult.forward.token;
+          }
+        } catch (_) {
+          safeResult = result;
+        }
+      }
+
+      const notes = toJsonNotes({ stage: 'completed', job: safeResult });
+
+      const finalize = await finalizeRequestExecution(client, requestRow, actorId, {
+        notes,
+        statusReason: reason,
+        eventId
+      });
+
+      return { eventId: finalize.eventId, statusReason: reason };
+    });
+
+    return res.json({
+      ok: true,
+      status: 'EXECUTED',
+      event_id: completion.eventId || eventId || null,
+      status_reason: completion.statusReason || statusReasonRaw || null,
+      already: !!completion.already
+    });
+  } catch (e) {
+    const status = e?.statusCode || 500;
+    console.error('execute_complete error:', e);
+    return res.status(status).json({ ok: false, error: e.message || 'execute_complete_failed' });
   }
 });
 
