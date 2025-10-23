@@ -751,8 +751,7 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     const lockerFromDb = primaryFirearm?.firearm_storage_locker
       || requestRow.storage_locker
       || null;
-    const locationFromDb = lockerFromDb
-      || requestRow.location
+    const locationFromDb = requestRow.location
       || null;
 
     const ammoPayload = ammoItems
@@ -819,8 +818,8 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       request_type: request.request_type || request.type || null,
       status: request.status || null,
       site_id: request.site_id || request.site || null,
-      locker: request.storage_locker || dispatch?.locker || null,
-      location: request.storage_locker || dispatch?.locker || request.location || null,
+      locker: dispatch?.locker || request.storage_locker || null,
+      location: request.location || dispatch?.location || null,
       scheduled_at: request.scheduled_at || null,
       purpose: request.purpose || null,
       requested_at: request.requested_at || request.created_at || null,
