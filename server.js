@@ -748,6 +748,13 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       ammo: ammoItems.length > 0
     };
 
+    const lockerFromDb = primaryFirearm?.firearm_storage_locker
+      || requestRow.storage_locker
+      || null;
+    const locationFromDb = lockerFromDb
+      || requestRow.location
+      || null;
+
     const ammoPayload = ammoItems
       .map((entry) => pruneEmpty({
         id: entry.ammo_id || entry.id || null,
@@ -772,8 +779,8 @@ app.delete('/api/ammunition/:id', async (req, res) => {
         locker: primaryFirearm.firearm_storage_locker || requestRow.storage_locker || null
       }) : undefined,
       ammo: ammoPayload && ammoPayload.length ? ammoPayload : undefined,
-      locker: requestRow.storage_locker || null,
-      location: requestRow.location || null,
+      locker: lockerFromDb || null,
+      location: locationFromDb || null,
       purpose: requestRow.purpose || null,
       requested_at: requestRow.requested_at || requestRow.created_at || null,
       approved_at: requestRow.approved_at || null,
@@ -812,8 +819,8 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       request_type: request.request_type || request.type || null,
       status: request.status || null,
       site_id: request.site_id || request.site || null,
-      location: request.location || null,
-      locker: request.storage_locker || null,
+      locker: request.storage_locker || dispatch?.locker || null,
+      location: request.storage_locker || dispatch?.locker || request.location || null,
       scheduled_at: request.scheduled_at || null,
       purpose: request.purpose || null,
       requested_at: request.requested_at || request.created_at || null,
@@ -1465,17 +1472,15 @@ app.post('/api/requests/:id/execute', async (req, res) => {
   const dispatchPayload = req.body?.dispatch || null;
 
   try {
-    if (!LOCAL_BRIDGE_URL) {
-      throw httpError(503, '로컬 브릿지가 설정되지 않았습니다');
-    }
-
-    await checkLocalBridgeHealth();
 
     const queued = await withTx(async (client) => {
       const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [id]);
       if (!rq.rowCount) throw httpError(404, 'not found');
       const requestRow = rq.rows[0];
-      if (requestRow.status !== 'APPROVED') throw httpError(400, 'not approved');
+      const statusKey = String(requestRow.status || '').toUpperCase();
+      if (!['APPROVED', 'DISPATCH_FAILED'].includes(statusKey)) {
+        throw httpError(400, 'not approved');
+      }
 
       const { dispatch, items } = await buildDispatchPayloadFromDb(client, requestRow, dispatchPayload);
       if (!dispatch) {
@@ -1506,35 +1511,65 @@ app.post('/api/requests/:id/execute', async (req, res) => {
       items: queued.items
     });
 
-    const dispatchResult = await sendRobotDispatch(payload);
-
-    if (!dispatchResult.ok) {
-      const reason = dispatchResult.error || 'local_dispatch_failed';
-      await withTx(async (client) => {
-        await client.query(`UPDATE requests SET status='DISPATCH_FAILED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, reason]);
-        await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
-          toJsonNotes({ stage: 'failed', reason, dispatch: dispatchPayload }),
-          queued.eventId
-        ]);
-      });
-      throw httpError(dispatchResult.status || 502, reason);
-    }
-
-    const job = dispatchResult.data?.job || null;
     await withTx(async (client) => {
-      const statusReason = job?.message || job?.summary?.actionLabel || '장비 명령 대기 중';
-      await client.query(`UPDATE requests SET status='DISPATCHED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, statusReason]);
       await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
-        toJsonNotes({ stage: 'dispatched', dispatch: queued.dispatch, payload, job }),
+        toJsonNotes({ stage: 'queued', dispatch: queued.dispatch, payload, manual: true }),
         queued.eventId
       ]);
     });
 
-    return res.json({ ok: true, status: 'DISPATCHED', job, payload, request_id: id });
+    return res.json({
+      ok: true,
+      status: 'DISPATCH_PENDING',
+      payload,
+      request_id: id,
+      event_id: queued.eventId,
+      dispatch: queued.dispatch,
+      items: queued.items,
+      bridge: {
+        configured: !!LOCAL_BRIDGE_URL,
+        autoDispatched: false,
+        manualRequired: true
+      }
+    });
   } catch (e) {
     const status = e?.statusCode || 500;
     console.error('execute error:', e);
     return res.status(status).json({ ok: false, error: e.message || 'execute_failed' });
+  }
+});
+
+app.post('/api/requests/:id/dispatch_fail', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const reasonRaw = req.body?.reason;
+  const actorId = req.body?.actor_id || null;
+  const reason = (typeof reasonRaw === 'string' && reasonRaw.trim()) ? reasonRaw.trim() : '로컬 브릿지 오류';
+
+  try {
+    await withTx(async (client) => {
+      const rq = await client.query(`SELECT status FROM requests WHERE id=$1 FOR UPDATE`, [id]);
+      if (!rq.rowCount) throw httpError(404, 'not found');
+      const statusKey = String(rq.rows[0].status || '').toUpperCase();
+      if (!['DISPATCH_PENDING', 'DISPATCHING', 'DISPATCH_FAILED'].includes(statusKey)) {
+        throw httpError(400, 'not dispatch_pending');
+      }
+
+      await client.query(`UPDATE requests SET status='DISPATCH_FAILED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, reason]);
+
+      const ev = await client.query(`SELECT id FROM execution_events WHERE request_id=$1 ORDER BY id DESC LIMIT 1`, [id]);
+      if (ev.rowCount) {
+        await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
+          toJsonNotes({ stage: 'failed', reason, manual: true, actorId }),
+          ev.rows[0].id
+        ]);
+      }
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    const status = e?.statusCode || 500;
+    console.error('dispatch_fail error:', e);
+    return res.status(status).json({ ok: false, error: e.message || 'dispatch_fail_failed' });
   }
 });
 
