@@ -128,7 +128,18 @@ const pool = new Pool({
 
 async function ensureDatabaseColumns() {
   const statements = [
-    `ALTER TABLE requests ADD COLUMN IF NOT EXISTS status_reason TEXT`
+    `ALTER TABLE requests ADD COLUMN IF NOT EXISTS status_reason TEXT`,
+    `CREATE TABLE IF NOT EXISTS fp_templates (
+       sensor_id INTEGER PRIMARY KEY,
+       person_id INTEGER NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+       site TEXT NOT NULL DEFAULT 'default',
+       last_enrolled TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+     )`,
+    `ALTER TABLE fp_templates ADD COLUMN IF NOT EXISTS site TEXT`,
+    `ALTER TABLE fp_templates ALTER COLUMN site SET DEFAULT 'default'`,
+    `ALTER TABLE fp_templates ADD COLUMN IF NOT EXISTS last_enrolled TIMESTAMPTZ`,
+    `ALTER TABLE fp_templates ALTER COLUMN last_enrolled SET DEFAULT CURRENT_TIMESTAMP`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_fp_templates_person ON fp_templates(person_id)`
   ];
   for (const sql of statements) {
     try {
@@ -2291,29 +2302,138 @@ app.get('/api/fp/last', (req, res) => {
 
 // 매핑 등록: sensor_id ↔ person_id
 app.post('/api/fp/map', async (req, res) => {
-  const { sensor_id, person_id, site='default' } = req.body || {};
-  if (!Number.isInteger(sensor_id) || !Number.isInteger(person_id)) {
-    return res.status(400).json({ error:'bad sensor_id or person_id' });
+  const { sensor_id, person_id } = req.body || {};
+  const siteRaw = typeof req.body?.site === 'string' ? req.body.site : '';
+  const site = siteRaw.trim() || 'default';
+
+  if (!Number.isInteger(sensor_id) || sensor_id <= 0 || !Number.isInteger(person_id) || person_id <= 0) {
+    return res.status(400).json({ error: 'bad sensor_id or person_id' });
   }
-  try{
-    await pool.query(
-      `INSERT INTO fp_templates(sensor_id, person_id, site)
-       VALUES($1,$2,$3)
-       ON CONFLICT (sensor_id) DO UPDATE SET person_id=EXCLUDED.person_id, site=EXCLUDED.site`,
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM fp_templates WHERE person_id=$1 AND sensor_id <> $2', [person_id, sensor_id]);
+    const { rows: upsertRows } = await client.query(
+      `INSERT INTO fp_templates(sensor_id, person_id, site, last_enrolled)
+       VALUES($1,$2,$3, CURRENT_TIMESTAMP)
+       ON CONFLICT (sensor_id) DO UPDATE
+         SET person_id=EXCLUDED.person_id,
+             site=EXCLUDED.site,
+             last_enrolled=CURRENT_TIMESTAMP
+       RETURNING sensor_id, person_id, site, last_enrolled`,
       [sensor_id, person_id, site]
     );
-    res.json({ ok:true });
-  }catch(e){ console.error(e); res.status(500).json({ error:'map_upsert_failed' }); }
+    const { rows: detailRows } = await client.query(
+      `SELECT t.sensor_id, t.person_id, t.site, t.last_enrolled,
+              p.name, p.rank, p.unit, p.position, p.user_id, p.military_id, p.is_admin, p.contact
+       FROM fp_templates t LEFT JOIN personnel p ON p.id=t.person_id
+       WHERE t.sensor_id = $1`,
+      [sensor_id]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true, mapping: detailRows[0] || upsertRows[0] });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('fp map upsert failed:', e);
+    res.status(500).json({ error: 'map_upsert_failed' });
+  } finally {
+    client.release();
+  }
 });
 
 // 매핑 조회(관리툴에서 볼 때)
 app.get('/api/fp/map', async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT t.sensor_id, t.site, t.person_id, p.name, p.is_admin
-     FROM fp_templates t LEFT JOIN personnel p ON p.id=t.person_id
-     ORDER BY t.sensor_id`
-  );
-  res.json(rows);
+  try {
+    const { rows } = await pool.query(
+      `SELECT t.sensor_id, t.site, t.person_id, t.last_enrolled,
+              p.name, p.rank, p.unit, p.position, p.user_id, p.military_id, p.is_admin, p.contact
+       FROM fp_templates t LEFT JOIN personnel p ON p.id=t.person_id
+       ORDER BY t.sensor_id`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('fp map fetch failed:', err);
+    res.status(500).json({ error: 'map_fetch_failed' });
+  }
+});
+
+app.get('/api/fp/assignments', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         p.id AS person_id,
+         p.name,
+         p.rank,
+         p.unit,
+         p.position,
+         p.user_id,
+         p.military_id,
+         p.contact,
+         p.is_admin,
+         t.sensor_id,
+         t.site,
+         t.last_enrolled
+       FROM personnel p
+       LEFT JOIN fp_templates t ON t.person_id = p.id
+       ORDER BY p.name, p.id`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('fp assignments fetch failed:', err);
+    res.status(500).json({ error: 'assignments_fetch_failed' });
+  }
+});
+
+app.delete('/api/fp/map/:sensorId', async (req, res) => {
+  const sensorId = Number.parseInt(req.params.sensorId, 10);
+  if (!Number.isInteger(sensorId) || sensorId <= 0) {
+    return res.status(400).json({ error: 'bad_sensor_id' });
+  }
+  try {
+    const { rowCount } = await pool.query('DELETE FROM fp_templates WHERE sensor_id=$1', [sensorId]);
+    if (!rowCount) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    res.json({ ok: true, deleted: rowCount });
+  } catch (err) {
+    console.error('fp map delete failed:', err);
+    res.status(500).json({ error: 'delete_failed' });
+  }
+});
+
+app.delete('/api/fp/person/:personId', async (req, res) => {
+  const personId = Number.parseInt(req.params.personId, 10);
+  if (!Number.isInteger(personId) || personId <= 0) {
+    return res.status(400).json({ error: 'bad_person_id' });
+  }
+  try {
+    const { rowCount } = await pool.query('DELETE FROM fp_templates WHERE person_id=$1', [personId]);
+    if (!rowCount) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    res.json({ ok: true, deleted: rowCount });
+  } catch (err) {
+    console.error('fp person delete failed:', err);
+    res.status(500).json({ error: 'delete_failed' });
+  }
+});
+
+app.delete('/api/fp/map', async (req, res) => {
+  const siteRaw = typeof req.query.site === 'string' ? req.query.site : '';
+  const site = siteRaw.trim();
+  try {
+    let rowCount = 0;
+    if (site) {
+      ({ rowCount } = await pool.query('DELETE FROM fp_templates WHERE site=$1', [site]));
+    } else {
+      ({ rowCount } = await pool.query('DELETE FROM fp_templates'));
+    }
+    res.json({ ok: true, deleted: rowCount });
+  } catch (err) {
+    console.error('fp map clear failed:', err);
+    res.status(500).json({ error: 'clear_failed' });
+  }
 });
 
 
