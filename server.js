@@ -842,15 +842,29 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     });
   }
 
-  async function finalizeRequestExecution(client, requestRow, executedBy, { notes = null, statusReason = null } = {}) {
+  async function finalizeRequestExecution(client, requestRow, executedBy, { notes = null, statusReason = null, eventId = null } = {}) {
     const id = requestRow.id;
     const eventType = requestRow.request_type || requestRow.type || 'EXECUTION';
-    const ev = await client.query(
-      `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
-       VALUES($1,$2,$3,$4) RETURNING id`,
-      [id, executedBy, eventType, notes]
-    );
-    const execId = ev.rows[0].id;
+    let execId = eventId || null;
+
+    if (eventId) {
+      await client.query(
+        `UPDATE execution_events
+            SET executed_by=$2,
+                event_type=$3,
+                notes=$4,
+                executed_at=now()
+          WHERE id=$1`,
+        [eventId, executedBy, eventType, notes]
+      );
+    } else {
+      const ev = await client.query(
+        `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
+         VALUES($1,$2,$3,$4) RETURNING id`,
+        [id, executedBy, eventType, notes]
+      );
+      execId = ev.rows[0].id;
+    }
 
     const items = await client.query(
       `SELECT item_type, firearm_id, ammo_id, quantity
@@ -950,25 +964,32 @@ app.delete('/api/ammunition/:id', async (req, res) => {
         if (!rq.rowCount) throw httpError(404, 'request_not_found');
         const requestRow = rq.rows[0];
         if (requestRow.status === 'EXECUTED') {
+          const completionNotes = toJsonNotes({ stage: 'completed', job, site });
           if (eventId) {
-            await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
+            await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, eventId]);
           }
           return;
         }
-        const execReq = await client.query(`SELECT id, executed_by FROM execution_events WHERE request_id=$1 AND event_type='EXECUTION_REQUEST' ORDER BY executed_at DESC LIMIT 1`, [requestId]);
-        const executedBy = job?.executedBy || job?.executorId || (execReq.rowCount ? execReq.rows[0].executed_by : null);
+
+        const execReq = eventId
+          ? await client.query(`SELECT id, executed_by FROM execution_events WHERE id=$1`, [eventId])
+          : await client.query(`SELECT id, executed_by FROM execution_events WHERE request_id=$1 ORDER BY executed_at DESC LIMIT 1`, [requestId]);
+        const execRow = execReq.rowCount ? execReq.rows[0] : null;
+        const executedBy = job?.executedBy || job?.executorId || execRow?.executed_by || null;
         const completionNotes = toJsonNotes({ stage: 'completed', job, site });
         const successReason = job?.message
           || (job?.summary?.actionLabel ? `${job.summary.actionLabel} 완료` : '장비 제어가 정상적으로 완료되었습니다.');
+
+        const primaryEventId = execRow?.id || eventId || null;
+
         await finalizeRequestExecution(client, requestRow, executedBy, {
           notes: completionNotes,
-          statusReason: successReason
+          statusReason: successReason,
+          eventId: primaryEventId
         });
-        if (eventId) {
-          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, eventId]);
-        }
-        if (execReq.rowCount && (!eventId || eventId !== execReq.rows[0].id)) {
-          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, execReq.rows[0].id]);
+
+        if (primaryEventId && (!execRow || primaryEventId !== execRow.id)) {
+          await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, primaryEventId]);
         }
       });
       return;
@@ -1290,44 +1311,54 @@ app.get('/api/requests', async (req, res) => {
   app.get('/api/requests/:id', async (req,res)=>{
     try{
       const id = req.params.id;
-      const { rows } = await pool.query(`
-        SELECT r.*, p.name AS requester_name
-        FROM requests r
-        LEFT JOIN personnel p ON p.id=r.requester_id
-        WHERE r.id=$1
-      `,[id]);
-      if(!rows.length) return res.status(404).json({error:'not found'});
-      const request = rows[0];
+      const detail = await withTx(async (client) => {
+        const rq = await client.query(`
+          SELECT r.*, p.name AS requester_name
+          FROM requests r
+          LEFT JOIN personnel p ON p.id=r.requester_id
+          WHERE r.id=$1
+        `,[id]);
+        if(!rq.rowCount) throw httpError(404, 'not found');
+        const request = rq.rows[0];
 
-      const items = (await pool.query(`
-        SELECT ri.*,
-              f.firearm_number, f.firearm_type,
-              a.ammo_name, a.ammo_category
-        FROM request_items ri
-        LEFT JOIN firearms   f ON f.id=ri.firearm_id
-        LEFT JOIN ammunition a ON a.id=ri.ammo_id
-        WHERE ri.request_id=$1
-        ORDER BY ri.id
-      `,[id])).rows;
+        const items = (await client.query(`
+          SELECT ri.*,
+                f.firearm_number, f.firearm_type, f.storage_locker AS firearm_storage_locker,
+                a.ammo_name, a.ammo_category, a.storage_locker AS ammo_storage_locker
+          FROM request_items ri
+          LEFT JOIN firearms   f ON f.id=ri.firearm_id
+          LEFT JOIN ammunition a ON a.id=ri.ammo_id
+          WHERE ri.request_id=$1
+          ORDER BY ri.id
+        `,[id])).rows;
 
-      const approvals = (await pool.query(`
-        SELECT ap.*, per.name AS approver_name
-        FROM approvals ap
-        LEFT JOIN personnel per ON per.id=ap.approver_id
-        WHERE ap.request_id=$1
-        ORDER BY ap.decided_at
-      `,[id])).rows;
+        const approvals = (await client.query(`
+          SELECT ap.*, per.name AS approver_name
+          FROM approvals ap
+          LEFT JOIN personnel per ON per.id=ap.approver_id
+          WHERE ap.request_id=$1
+          ORDER BY ap.decided_at
+        `,[id])).rows;
 
-      const executions = (await pool.query(`
-        SELECT e.*, per.name AS executed_by_name
-        FROM execution_events e
-        LEFT JOIN personnel per ON per.id=e.executed_by
-        WHERE e.request_id=$1
-        ORDER BY e.executed_at
-      `,[id])).rows;
+        const executions = (await client.query(`
+          SELECT e.*, per.name AS executed_by_name
+          FROM execution_events e
+          LEFT JOIN personnel per ON per.id=e.executed_by
+          WHERE e.request_id=$1
+          ORDER BY e.executed_at
+        `,[id])).rows;
 
-      res.json({ request, items, approvals, executions });
-    }catch(e){ console.error(e); res.status(500).json({error:'detail failed'}); }
+        const dispatchInfo = await buildDispatchPayloadFromDb(client, request, null);
+
+        return { request, items, approvals, executions, dispatch: dispatchInfo?.dispatch || null };
+      });
+
+      res.json(detail);
+    }catch(e){
+      if (e?.statusCode === 404) return res.status(404).json({error:'not found'});
+      console.error(e);
+      res.status(500).json({error:'detail failed'});
+    }
   });
 
     app.post('/api/requests/:id/cancel', async (req,res)=>{
@@ -1487,10 +1518,12 @@ app.post('/api/requests/:id/execute', async (req, res) => {
       }
 
       await client.query(`UPDATE requests SET status_reason='장비 명령 준비 중', updated_at=now() WHERE id=$1`, [id]);
+      const eventType = requestRow.request_type || requestRow.type || 'DISPATCH';
+      const queuedNotes = toJsonNotes({ stage: 'queued', dispatch });
       const ev = await client.query(
         `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
          VALUES($1,$2,$3,$4) RETURNING id`,
-        [id, executed_by, 'EXECUTION_REQUEST', toJsonNotes({ stage: 'queued', dispatch })]
+        [id, executed_by, eventType, queuedNotes]
       );
 
       let executor = null;
@@ -1510,17 +1543,60 @@ app.post('/api/requests/:id/execute', async (req, res) => {
       items: queued.items
     });
 
+        let manualRequired = true;
+    let autoDispatched = false;
+    let bridgeHealth = null;
+    let bridgeError = null;
+
+    if (LOCAL_BRIDGE_URL) {
+      try {
+        bridgeHealth = await checkLocalBridgeHealth();
+        const autoResult = await sendRobotDispatch(payload);
+        if (autoResult.ok) {
+          manualRequired = false;
+          autoDispatched = true;
+        } else {
+          bridgeError = new Error(autoResult.error || 'auto_dispatch_failed');
+          bridgeError.statusCode = autoResult.status || 503;
+        }
+      } catch (bridgeErr) {
+        bridgeError = bridgeErr instanceof Error ? bridgeErr : new Error(String(bridgeErr));
+      }
+    }
+
+    if (bridgeError) {
+      console.warn('robot auto dispatch unavailable', bridgeError);
+    }
+
+    const stageNotes = toJsonNotes({
+      stage: 'queued',
+      dispatch: queued.dispatch,
+      payload: manualRequired ? payload : null,
+      manual: manualRequired,
+      autoDispatched,
+      bridge: {
+        configured: !!LOCAL_BRIDGE_URL,
+        health: bridgeHealth || null,
+        error: bridgeError ? (bridgeError.message || String(bridgeError)) : null
+      }
+    });
+
     await withTx(async (client) => {
-      await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
-        toJsonNotes({ stage: 'queued', dispatch: queued.dispatch, payload, manual: true }),
-        queued.eventId
-      ]);
+      await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [stageNotes, queued.eventId]);
+      if (bridgeError) {
+        await client.query(`UPDATE requests SET status_reason=$2, updated_at=now() WHERE id=$1`, [
+          id,
+          bridgeError.message || '로컬 브릿지 확인 필요'
+        ]);
+      }
     });
 
     return res.json({
       ok: true,
       status: queued.request.status || 'APPROVED',
-      status_reason: '장비 명령 준비 중',
+      status_reason: bridgeError
+        ? (bridgeError.message || '로컬 브릿지 확인 필요')
+        : '장비 명령 준비 중',
       payload,
       request_id: id,
       event_id: queued.eventId,
@@ -1528,8 +1604,10 @@ app.post('/api/requests/:id/execute', async (req, res) => {
       items: queued.items,
       bridge: {
         configured: !!LOCAL_BRIDGE_URL,
-        autoDispatched: false,
-        manualRequired: true
+        autoDispatched,
+        manualRequired,
+        health: bridgeHealth || null,
+        error: bridgeError ? (bridgeError.message || String(bridgeError)) : null
       }
     });
   } catch (e) {
