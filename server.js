@@ -19,6 +19,36 @@ async function fetchWithFallback(url, options) {
   return fetchFallback(url, options);
 }
 
+function pruneEmpty(value) {
+  if (Array.isArray(value)) {
+    const arr = value
+      .map((entry) => pruneEmpty(entry))
+      .filter((entry) => {
+        if (entry === undefined || entry === null) return false;
+        if (typeof entry === 'object' && !Array.isArray(entry) && !Object.keys(entry).length) return false;
+        return true;
+      });
+    return arr.length ? arr : undefined;
+  }
+
+  if (value && typeof value === 'object' && value.constructor === Object) {
+    const obj = Object.entries(value).reduce((acc, [key, val]) => {
+      const next = pruneEmpty(val);
+      if (next !== undefined) {
+        acc[key] = next;
+      }
+      return acc;
+    }, {});
+    return Object.keys(obj).length ? obj : undefined;
+  }
+
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+
+  return value;
+}
+
 function httpError(status, message) {
   const err = new Error(message);
   err.statusCode = status;
@@ -39,6 +69,46 @@ const LOCAL_BRIDGE_URL = trimSlash(process.env.LOCAL_BRIDGE_URL || process.env.R
 const LOCAL_BRIDGE_TOKEN = process.env.LOCAL_BRIDGE_TOKEN || process.env.ROBOT_BRIDGE_TOKEN || '';
 const ROBOT_EVENT_TOKEN = process.env.ROBOT_SITE_TOKEN || process.env.FP_SITE_TOKEN || '';
 
+async function fetchLocalBridge(pathname, options = {}, { timeoutMs = 5000 } = {}) {
+  if (!LOCAL_BRIDGE_URL) {
+    throw httpError(503, '로컬 브릿지가 설정되지 않았습니다');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers = Object.assign({}, options.headers || {});
+    const url = `${LOCAL_BRIDGE_URL}${pathname}`;
+    const res = await fetchWithFallback(url, {
+      ...options,
+      headers,
+      signal: controller.signal
+    });
+    return res;
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw httpError(504, '로컬 브릿지 응답 지연');
+    }
+    throw httpError(503, `로컬 브릿지 연결 실패: ${err.message || err}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkLocalBridgeHealth() {
+  const headers = { Accept: 'application/json' };
+  if (LOCAL_BRIDGE_TOKEN) headers['x-bridge-token'] = LOCAL_BRIDGE_TOKEN;
+  const res = await fetchLocalBridge('/health', { method: 'GET', headers }, { timeoutMs: 2500 });
+  if (!res.ok) {
+    throw httpError(503, `로컬 브릿지 헬스체크 실패: HTTP ${res.status}`);
+  }
+  try {
+    return await res.json();
+  } catch (_) {
+    return null;
+  }
+}
 
 app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
 
@@ -627,7 +697,146 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     }
   }
 
-  async function finalizeRequestExecution(client, requestRow, executedBy, { notes = null } = {}) {
+    function mergeDispatchPayload(primary, fallback) {
+    const a = pruneEmpty(primary);
+    const b = pruneEmpty(fallback);
+    if (!a && !b) return undefined;
+    if (!a) return b;
+    if (!b) return a;
+
+    const includes = pruneEmpty({
+      ...(b.includes || {}),
+      ...(a.includes || {})
+    });
+
+    const firearm = pruneEmpty({
+      ...(b.firearm || {}),
+      ...(a.firearm || {})
+    });
+
+    const ammo = Array.isArray(a.ammo) && a.ammo.length
+      ? a.ammo
+      : (Array.isArray(b.ammo) && b.ammo.length ? b.ammo : undefined);
+
+    return pruneEmpty({
+      ...b,
+      ...a,
+      includes,
+      firearm,
+      ammo
+    });
+  }
+
+  async function buildDispatchPayloadFromDb(client, requestRow, incomingDispatch) {
+    const items = (await client.query(`
+      SELECT ri.*, 
+             f.firearm_number, f.firearm_type, f.storage_locker AS firearm_storage_locker,
+             a.ammo_name, a.ammo_category, a.storage_locker AS ammo_storage_locker
+        FROM request_items ri
+        LEFT JOIN firearms f   ON f.id = ri.firearm_id
+        LEFT JOIN ammunition a ON a.id = ri.ammo_id
+       WHERE ri.request_id = $1
+       ORDER BY ri.id
+    `, [requestRow.id])).rows;
+
+    const firearmItems = items.filter((row) => String(row.item_type || '').toUpperCase() === 'FIREARM');
+    const ammoItems = items.filter((row) => String(row.item_type || '').toUpperCase() === 'AMMO');
+    const primaryFirearm = firearmItems[0] || null;
+
+    const includes = {
+      firearm: firearmItems.length > 0,
+      ammo: ammoItems.length > 0
+    };
+
+    const ammoPayload = ammoItems
+      .map((entry) => pruneEmpty({
+        id: entry.ammo_id || entry.id || null,
+        name: entry.ammo_name || null,
+        category: entry.ammo_category || null,
+        qty: entry.quantity || entry.qty || null,
+        locker: entry.ammo_storage_locker || null
+      })) || [];
+
+    const dispatchFromDb = pruneEmpty({
+      request_id: requestRow.id,
+      site_id: requestRow.site_id || requestRow.site || null,
+      type: requestRow.request_type || requestRow.type || null,
+      mode: includes.firearm && includes.ammo
+        ? 'firearm_and_ammo'
+        : (includes.firearm ? 'firearm_only' : (includes.ammo ? 'ammo_only' : 'none')),
+      includes,
+      firearm: primaryFirearm ? pruneEmpty({
+        id: primaryFirearm.firearm_id || primaryFirearm.id || null,
+        code: primaryFirearm.firearm_number || null,
+        type: primaryFirearm.firearm_type || null,
+        locker: primaryFirearm.firearm_storage_locker || requestRow.storage_locker || null
+      }) : undefined,
+      ammo: ammoPayload && ammoPayload.length ? ammoPayload : undefined,
+      locker: requestRow.storage_locker || null,
+      location: requestRow.location || null,
+      purpose: requestRow.purpose || null,
+      requested_at: requestRow.requested_at || requestRow.created_at || null,
+      approved_at: requestRow.approved_at || null,
+      status: requestRow.status || null
+    });
+
+    const mergedDispatch = mergeDispatchPayload(incomingDispatch, dispatchFromDb);
+
+    const itemsPayload = pruneEmpty(items.map((entry) => ({
+      id: entry.id || null,
+      item_type: entry.item_type || null,
+      quantity: entry.quantity || null,
+      firearm_id: entry.firearm_id || null,
+      ammo_id: entry.ammo_id || null,
+      firearm: entry.firearm_id ? pruneEmpty({
+        id: entry.firearm_id,
+        number: entry.firearm_number || null,
+        type: entry.firearm_type || null,
+        locker: entry.firearm_storage_locker || null
+      }) : undefined,
+      ammo: entry.ammo_id ? pruneEmpty({
+        id: entry.ammo_id,
+        name: entry.ammo_name || null,
+        category: entry.ammo_category || null,
+        locker: entry.ammo_storage_locker || null
+      }) : undefined
+    })));
+
+    return { dispatch: mergedDispatch, items: itemsPayload };
+  }
+
+  function buildRobotDispatchPayload({ request, executor, executedBy, dispatch, eventId, items }) {
+    const requestSummary = pruneEmpty({
+      id: request.id,
+      requester_id: request.requester_id,
+      request_type: request.request_type || request.type || null,
+      status: request.status || null,
+      site_id: request.site_id || request.site || null,
+      location: request.location || null,
+      locker: request.storage_locker || null,
+      scheduled_at: request.scheduled_at || null,
+      purpose: request.purpose || null,
+      requested_at: request.requested_at || request.created_at || null,
+      approved_at: request.approved_at || null
+    });
+
+    return pruneEmpty({
+      requestId: request.id,
+      executionEventId: eventId,
+      executedBy: executedBy || null,
+      executor: executor || null,
+      dispatch,
+      items,
+      request: requestSummary,
+      type: request.request_type || null,
+      mode: dispatch?.mode || null,
+      site: dispatch?.site_id || request.site_id || request.site || null,
+      status: request.status || null,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  async function finalizeRequestExecution(client, requestRow, executedBy, { notes = null, statusReason = null } = {}) {
     const id = requestRow.id;
     const eventType = requestRow.request_type || requestRow.type || 'EXECUTION';
     const ev = await client.query(
@@ -671,40 +880,18 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       }
     }
 
-    await client.query(`UPDATE requests SET status='EXECUTED', status_reason=NULL, updated_at=now() WHERE id=$1`, [id]);
+    await client.query(`UPDATE requests SET status='EXECUTED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, statusReason || null]);
     return { eventId: execId };
-  }
-
-  function buildRobotDispatchPayload({ request, executor, executedBy, dispatch, eventId }) {
-    const mode = dispatch?.mode
-      || (request.request_type === 'DISPATCH' ? 'dispatch'
-        : (request.request_type === 'RETURN' ? 'return' : 'auto'));
-    return {
-      requestId: request.id,
-      executionEventId: eventId,
-      executedBy: executedBy || null,
-      executor: executor || null,
-      dispatch: dispatch || null,
-      type: request.request_type,
-      mode,
-      site: dispatch?.site_id || request.site_id || request.site || null,
-      status: request.status,
-      purpose: request.purpose || null,
-      location: request.location || null,
-      requestedAt: request.requested_at || request.created_at || null,
-      approvedAt: request.approved_at || null
-    };
   }
 
   async function sendRobotDispatch(payload) {
     if (!LOCAL_BRIDGE_URL) {
       return { ok: false, skipped: true, error: 'bridge_unconfigured' };
     }
-    const url = `${LOCAL_BRIDGE_URL}/robot/execute`;
     try {
       const headers = { 'content-type': 'application/json' };
       if (LOCAL_BRIDGE_TOKEN) headers['x-bridge-token'] = LOCAL_BRIDGE_TOKEN;
-      const res = await fetchWithFallback(url, {
+      const res = await fetchLocalBridge('/robot/execute', {
         method: 'POST',
         headers,
         body: JSON.stringify(payload)
@@ -716,7 +903,7 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       }
       return { ok: true, data };
     } catch (err) {
-      return { ok: false, error: err.message || String(err) };
+      return { ok: false, error: err.message || String(err), status: err.statusCode || err.status || undefined };
     }
   }
 
@@ -765,7 +952,12 @@ app.delete('/api/ammunition/:id', async (req, res) => {
         const execReq = await client.query(`SELECT id, executed_by FROM execution_events WHERE request_id=$1 AND event_type='EXECUTION_REQUEST' ORDER BY executed_at DESC LIMIT 1`, [requestId]);
         const executedBy = job?.executedBy || job?.executorId || (execReq.rowCount ? execReq.rows[0].executed_by : null);
         const completionNotes = toJsonNotes({ stage: 'completed', job, site });
-        await finalizeRequestExecution(client, requestRow, executedBy, { notes: completionNotes });
+        const successReason = job?.message
+          || (job?.summary?.actionLabel ? `${job.summary.actionLabel} 완료` : '장비 제어가 정상적으로 완료되었습니다.');
+        await finalizeRequestExecution(client, requestRow, executedBy, {
+          notes: completionNotes,
+          statusReason: successReason
+        });
         if (eventId) {
           await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [completionNotes, eventId]);
         }
@@ -1266,26 +1458,18 @@ app.post('/api/requests/:id/reject', async (req,res)=>{
 });
 
 
-// 집행: 장비 제어가 연결되어 있으면 로컬 브릿지로 위임, 아니면 즉시 반영
-app.post('/api/requests/:id/execute', async (req,res)=>{
+// 집행: 로컬 로봇 브릿지로 명령을 위임하고 진행 상황을 트래킹
+app.post('/api/requests/:id/execute', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const executed_by = req.body?.executed_by || null;
   const dispatchPayload = req.body?.dispatch || null;
 
   try {
     if (!LOCAL_BRIDGE_URL) {
-      const result = await withTx(async (client) => {
-        const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [id]);
-        if (!rq.rowCount) throw httpError(404, 'not found');
-        const requestRow = rq.rows[0];
-        if (requestRow.status !== 'APPROVED') throw httpError(400, 'not approved');
-        await finalizeRequestExecution(client, requestRow, executed_by, {
-          notes: toJsonNotes({ stage: 'immediate', dispatch: dispatchPayload })
-        });
-        return { request: requestRow };
-      });
-      return res.json({ ok: true, status: 'EXECUTED', mode: 'immediate', request_id: id, request_type: result.request.request_type });
+      throw httpError(503, '로컬 브릿지가 설정되지 않았습니다');
     }
+
+    await checkLocalBridgeHealth();
 
     const queued = await withTx(async (client) => {
       const rq = await client.query(`SELECT * FROM requests WHERE id=$1 FOR UPDATE`, [id]);
@@ -1293,11 +1477,16 @@ app.post('/api/requests/:id/execute', async (req,res)=>{
       const requestRow = rq.rows[0];
       if (requestRow.status !== 'APPROVED') throw httpError(400, 'not approved');
 
+      const { dispatch, items } = await buildDispatchPayloadFromDb(client, requestRow, dispatchPayload);
+      if (!dispatch) {
+        throw httpError(400, '장비 제어 데이터가 부족합니다');
+      }
+
       await client.query(`UPDATE requests SET status='DISPATCH_PENDING', status_reason='장비 명령 준비 중', updated_at=now() WHERE id=$1`, [id]);
       const ev = await client.query(
         `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
          VALUES($1,$2,$3,$4) RETURNING id`,
-        [id, executed_by, 'EXECUTION_REQUEST', toJsonNotes({ stage: 'queued', dispatch: dispatchPayload })]
+        [id, executed_by, 'EXECUTION_REQUEST', toJsonNotes({ stage: 'queued', dispatch })]
       );
 
       let executor = null;
@@ -1305,15 +1494,16 @@ app.post('/api/requests/:id/execute', async (req,res)=>{
         const ex = await client.query(`SELECT id, name, rank, unit, position FROM personnel WHERE id=$1`, [executed_by]);
         executor = ex.rowCount ? ex.rows[0] : null;
       }
-      return { request: requestRow, eventId: ev.rows[0].id, executor };
+      return { request: requestRow, eventId: ev.rows[0].id, executor, dispatch, items };
     });
 
     const payload = buildRobotDispatchPayload({
       request: queued.request,
       executor: queued.executor,
       executedBy: executed_by,
-      dispatch: dispatchPayload,
-      eventId: queued.eventId
+      dispatch: queued.dispatch,
+      eventId: queued.eventId,
+      items: queued.items
     });
 
     const dispatchResult = await sendRobotDispatch(payload);
@@ -1327,26 +1517,26 @@ app.post('/api/requests/:id/execute', async (req,res)=>{
           queued.eventId
         ]);
       });
-      throw httpError(502, reason);
+      throw httpError(dispatchResult.status || 502, reason);
     }
 
     const job = dispatchResult.data?.job || null;
     await withTx(async (client) => {
-      await client.query(`UPDATE requests SET status='DISPATCHED', status_reason='장비 명령 대기 중', updated_at=now() WHERE id=$1`, [id]);
+      const statusReason = job?.message || job?.summary?.actionLabel || '장비 명령 대기 중';
+      await client.query(`UPDATE requests SET status='DISPATCHED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, statusReason]);
       await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [
-        toJsonNotes({ stage: 'dispatched', dispatch: dispatchPayload, job }),
+        toJsonNotes({ stage: 'dispatched', dispatch: queued.dispatch, payload, job }),
         queued.eventId
       ]);
     });
 
-    return res.json({ ok: true, status: 'DISPATCHED', job, request_id: id });
+    return res.json({ ok: true, status: 'DISPATCHED', job, payload, request_id: id });
   } catch (e) {
     const status = e?.statusCode || 500;
     console.error('execute error:', e);
     return res.status(status).json({ ok: false, error: e.message || 'execute_failed' });
   }
 });
-
 
 // 재오픈: APPROVED/REJECTED/선택적으로 CANCELLED -> SUBMITTED 로 되돌림
 app.post('/api/requests/:id/reopen', async (req,res)=>{
