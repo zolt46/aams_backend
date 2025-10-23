@@ -926,7 +926,7 @@ app.delete('/api/ammunition/:id', async (req, res) => {
 
     if (normalized === 'accepted' || normalized === 'queued' || normalized === 'dispatched') {
       await withTx(async (client) => {
-        await client.query(`UPDATE requests SET status='DISPATCHED', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, message || '장비 명령 대기 중']);
+        await client.query(`UPDATE requests SET status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, message || '장비 명령 대기 중']);
         if (eventId) {
           await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
         }
@@ -936,7 +936,7 @@ app.delete('/api/ammunition/:id', async (req, res) => {
 
     if (normalized === 'progress' || normalized === 'executing' || normalized === 'running') {
       await withTx(async (client) => {
-        await client.query(`UPDATE requests SET status='EXECUTING', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, message || stage || '장비 동작 중']);
+        await client.query(`UPDATE requests SET status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, message || stage || '장비 동작 중']);
         if (eventId) {
           await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
         }
@@ -977,7 +977,7 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     if (normalized === 'error' || normalized === 'failed' || normalized === 'timeout') {
       const reason = message || stage || '장비 오류';
       await withTx(async (client) => {
-        await client.query(`UPDATE requests SET status='EXECUTION_FAILED', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, reason]);
+        await client.query(`UPDATE requests SET status='APPROVED', status_reason=$2, updated_at=now() WHERE id=$1`, [requestId, reason]);
         if (eventId) {
           await client.query(`UPDATE execution_events SET notes=$1 WHERE id=$2`, [notesPayload, eventId]);
         }
@@ -1477,7 +1477,7 @@ app.post('/api/requests/:id/execute', async (req, res) => {
       if (!rq.rowCount) throw httpError(404, 'not found');
       const requestRow = rq.rows[0];
       const statusKey = String(requestRow.status || '').toUpperCase();
-      if (!['APPROVED', 'DISPATCH_FAILED'].includes(statusKey)) {
+      if (statusKey !== 'APPROVED') {
         throw httpError(400, 'not approved');
       }
 
@@ -1486,7 +1486,7 @@ app.post('/api/requests/:id/execute', async (req, res) => {
         throw httpError(400, '장비 제어 데이터가 부족합니다');
       }
 
-      await client.query(`UPDATE requests SET status='DISPATCH_PENDING', status_reason='장비 명령 준비 중', updated_at=now() WHERE id=$1`, [id]);
+      await client.query(`UPDATE requests SET status_reason='장비 명령 준비 중', updated_at=now() WHERE id=$1`, [id]);
       const ev = await client.query(
         `INSERT INTO execution_events(request_id, executed_by, event_type, notes)
          VALUES($1,$2,$3,$4) RETURNING id`,
@@ -1519,7 +1519,8 @@ app.post('/api/requests/:id/execute', async (req, res) => {
 
     return res.json({
       ok: true,
-      status: 'DISPATCH_PENDING',
+      status: queued.request.status || 'APPROVED',
+      status_reason: '장비 명령 준비 중',
       payload,
       request_id: id,
       event_id: queued.eventId,
@@ -1549,11 +1550,11 @@ app.post('/api/requests/:id/dispatch_fail', async (req, res) => {
       const rq = await client.query(`SELECT status FROM requests WHERE id=$1 FOR UPDATE`, [id]);
       if (!rq.rowCount) throw httpError(404, 'not found');
       const statusKey = String(rq.rows[0].status || '').toUpperCase();
-      if (!['DISPATCH_PENDING', 'DISPATCHING', 'DISPATCH_FAILED'].includes(statusKey)) {
+      if (statusKey !== 'APPROVED') {
         throw httpError(400, 'not dispatch_pending');
       }
 
-      await client.query(`UPDATE requests SET status='DISPATCH_FAILED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, reason]);
+      await client.query(`UPDATE requests SET status='APPROVED', status_reason=$2, updated_at=now() WHERE id=$1`, [id, reason]);
 
       const ev = await client.query(`SELECT id FROM execution_events WHERE request_id=$1 ORDER BY id DESC LIMIT 1`, [id]);
       if (ev.rowCount) {
