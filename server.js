@@ -91,6 +91,23 @@ const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, 
 const now = () => Date.now();
 const TICKET_TTL_MS = 1_000; // 10초
 
+ 
+const SESSION_COOKIE_ENABLED =
+  (process.env.SESSION_COOKIE_ENABLED || process.env.AAMS_SESSION_ENABLED || '0') === '1';
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'aams_session';
+const SESSION_COOKIE_DOMAIN = process.env.SESSION_COOKIE_DOMAIN || undefined;
+const SESSION_COOKIE_PATH = process.env.SESSION_COOKIE_PATH || '/';
+const sessionMaxAgeRaw = Number(process.env.SESSION_COOKIE_MAX_AGE || 7 * 24 * 60 * 60 * 1000);
+const SESSION_COOKIE_MAX_AGE = Number.isFinite(sessionMaxAgeRaw) && sessionMaxAgeRaw > 0
+  ? sessionMaxAgeRaw
+  : 7 * 24 * 60 * 60 * 1000;
+const SESSION_COOKIE_SECURE = (process.env.SESSION_COOKIE_SECURE || '1') !== '0';
+const rawSameSite = (process.env.SESSION_COOKIE_SAMESITE || 'none').toLowerCase();
+const allowedSameSite = new Set(['lax', 'strict', 'none']);
+const SESSION_COOKIE_SAME_SITE = allowedSameSite.has(rawSameSite) ? rawSameSite : 'none';
+const SESSION_COOKIE_HTTP_ONLY = (process.env.SESSION_COOKIE_HTTP_ONLY || '1') !== '0';
+
+ 
 const sessionStore = new Map();
 
 function generateSessionId() {
@@ -271,21 +288,7 @@ const DEFAULT_ROBOT_EVENT_URL = normalizeBaseUrl(
   { allowHttp: false }
 );
 
-const SESSION_COOKIE_ENABLED =
-  (process.env.SESSION_COOKIE_ENABLED || process.env.AAMS_SESSION_ENABLED || '0') === '1';
-const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'aams_session';
-const SESSION_COOKIE_DOMAIN = process.env.SESSION_COOKIE_DOMAIN || undefined;
-const SESSION_COOKIE_PATH = process.env.SESSION_COOKIE_PATH || '/';
-const sessionMaxAgeRaw = Number(process.env.SESSION_COOKIE_MAX_AGE || 7 * 24 * 60 * 60 * 1000);
-const SESSION_COOKIE_MAX_AGE = Number.isFinite(sessionMaxAgeRaw) && sessionMaxAgeRaw > 0
-  ? sessionMaxAgeRaw
-  : 7 * 24 * 60 * 60 * 1000;
-const SESSION_COOKIE_SECURE = (process.env.SESSION_COOKIE_SECURE || '1') !== '0';
-const rawSameSite = (process.env.SESSION_COOKIE_SAMESITE || 'none').toLowerCase();
-const allowedSameSite = new Set(['lax', 'strict', 'none']);
-const SESSION_COOKIE_SAME_SITE = allowedSameSite.has(rawSameSite) ? rawSameSite : 'none';
-const SESSION_COOKIE_HTTP_ONLY = (process.env.SESSION_COOKIE_HTTP_ONLY || '1') !== '0';
-
+ 
 const allowInsecureBridgeHints = (process.env.ALLOW_INSECURE_BRIDGE_HINTS || '') === '1';
 
 if (SESSION_COOKIE_ENABLED && SESSION_COOKIE_SAME_SITE === 'none' && !SESSION_COOKIE_SECURE) {
