@@ -1,15 +1,195 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
-require('dotenv').config();
+const crypto = require('crypto');
+
+require('./config/loadEnv').loadEnv();
 
 const app = express();
 const port = process.env.PORT || 3000;
 const path = require('path');
 
+app.set('trust proxy', 1);
+
+function sanitizeHttpsUrl(value, { allowPath = true, allowHttp = false } = {}) {
+  if (!value) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    return '';
+  }
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol === 'https:') {
+    // ok
+  } else if (allowHttp && protocol === 'http:') {
+    // explicitly allowed (dev only)
+  } else {
+    return '';
+  }
+
+  parsed.hash = '';
+  parsed.search = '';
+  if (!allowPath) {
+    parsed.pathname = '/';
+  }
+
+  const pathname = allowPath ? parsed.pathname.replace(/\/$/, '') : '';
+  const origin = parsed.origin;
+  if (!origin) return '';
+  return allowPath ? `${origin}${pathname}` : origin;
+}
+
+function sanitizeOrigins(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/[,\s]+/)
+    .map((entry) => sanitizeHttpsUrl(entry, { allowPath: false }))
+    .filter(Boolean);
+}
+
+const rawCorsOrigins =
+  process.env.CORS_ALLOW_ORIGINS ||
+  process.env.CORS_ALLOWED_ORIGINS ||
+  process.env.ALLOWED_ORIGINS ||
+  '';
+const corsOrigins = sanitizeOrigins(rawCorsOrigins);
+const allowAllOrigins = corsOrigins.length === 0;
+if (allowAllOrigins) {
+  console.warn('[config] CORS_ALLOW_ORIGINS not set; defaulting to allow all origins.');
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) {
+      return callback(null, true);
+    }
+    const normalized = sanitizeHttpsUrl(origin, { allowPath: false });
+    if (!normalized) {
+      return callback(new Error('Origin not allowed by CORS policy'));
+    }
+    if (allowAllOrigins || corsOrigins.includes(normalized)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Origin not allowed by CORS policy'));
+  },
+  credentials: true,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'x-bridge-token',
+    'x-fp-token'
+  ],
+  maxAge: 86400
+};
+
 const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, exp, used:false }
 const now = () => Date.now();
 const TICKET_TTL_MS = 1_000; // 10초
+
+const sessionStore = new Map();
+
+function generateSessionId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function registerSession(payload) {
+  const sessionId = generateSessionId();
+  const exp = now() + SESSION_COOKIE_MAX_AGE;
+  const record = {
+    id: sessionId,
+    userId: payload.userId,
+    personId: payload.personId,
+    name: payload.name,
+    isAdmin: payload.isAdmin,
+    exp
+  };
+  sessionStore.set(sessionId, record);
+  return record;
+}
+
+function getSession(sessionId) {
+  if (!sessionId) return null;
+  const record = sessionStore.get(sessionId);
+  if (!record) return null;
+  if (record.exp && record.exp < now()) {
+    sessionStore.delete(sessionId);
+    return null;
+  }
+  return record;
+}
+
+function destroySession(sessionId) {
+  if (!sessionId) return false;
+  return sessionStore.delete(sessionId);
+}
+
+function cleanupExpiredSessions(reference = now()) {
+  for (const [id, record] of sessionStore.entries()) {
+    if (!record?.exp) continue;
+    if (record.exp <= reference) {
+      sessionStore.delete(id);
+    }
+  }
+}
+
+function parseCookies(header = '') {
+  return header
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((acc, entry) => {
+      const sep = entry.indexOf('=');
+      if (sep === -1) return acc;
+      const key = entry.slice(0, sep).trim();
+      const val = entry.slice(sep + 1).trim();
+      if (!key) return acc;
+      try {
+        acc[key] = decodeURIComponent(val);
+      } catch (_) {
+        acc[key] = val;
+      }
+      return acc;
+    }, {});
+}
+
+function extractSessionId(req) {
+  if (!SESSION_COOKIE_ENABLED) return null;
+  const header = req.headers?.cookie;
+  if (!header) return null;
+  const cookies = parseCookies(header);
+  return cookies[SESSION_COOKIE_NAME] || null;
+}
+
+function attachSession(req, _res, next) {
+  if (!SESSION_COOKIE_ENABLED) return next();
+  const sessionId = extractSessionId(req);
+  if (!sessionId) return next();
+  const record = getSession(sessionId);
+  if (!record) return next();
+  req.session = {
+    id: record.id,
+    userId: record.userId,
+    personId: record.personId,
+    name: record.name,
+    isAdmin: record.isAdmin
+  };
+  return next();
+}
+
+if (SESSION_COOKIE_ENABLED) {
+  const interval = setInterval(() => cleanupExpiredSessions(now()), 30 * 60 * 1000);
+  if (typeof interval.unref === 'function') {
+    interval.unref();
+  }
+}
 
 const fetchFallback = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 async function fetchWithFallback(url, options) {
@@ -65,11 +245,52 @@ function trimSlash(value = '') {
   return value ? String(value).replace(/\/+$/, '') : '';
 }
 
-const LOCAL_BRIDGE_URL = trimSlash(process.env.LOCAL_BRIDGE_URL || process.env.ROBOT_BRIDGE_URL || process.env.FP_LOCAL_BRIDGE_URL || '');
+function normalizeBaseUrl(value, { allowHttp = false } = {}) {
+  const sanitized = sanitizeHttpsUrl(value, { allowHttp });
+  return sanitized ? trimSlash(sanitized) : '';
+}
+
+const allowInsecureBridge = (process.env.ALLOW_INSECURE_LOCAL_BRIDGE || '') === '1';
+const rawLocalBridgeUrl =
+  process.env.LOCAL_BRIDGE_URL ||
+  process.env.ROBOT_BRIDGE_URL ||
+  process.env.FP_LOCAL_BRIDGE_URL ||
+  '';
+const LOCAL_BRIDGE_URL = normalizeBaseUrl(rawLocalBridgeUrl, { allowHttp: allowInsecureBridge });
+if (!LOCAL_BRIDGE_URL && rawLocalBridgeUrl) {
+  console.warn(
+    '[config] LOCAL_BRIDGE_URL ignored because it must be an HTTPS endpoint. Set ALLOW_INSECURE_LOCAL_BRIDGE=1 for development.'
+  );
+}
 const LOCAL_BRIDGE_TOKEN = process.env.LOCAL_BRIDGE_TOKEN || process.env.ROBOT_BRIDGE_TOKEN || '';
 const ROBOT_EVENT_TOKEN = process.env.ROBOT_SITE_TOKEN || process.env.FP_SITE_TOKEN || '';
-const PUBLIC_API_BASE = trimSlash(process.env.PUBLIC_API_BASE || process.env.ROBOT_EVENT_BASE || '');
-const DEFAULT_ROBOT_EVENT_URL = trimSlash(process.env.ROBOT_EVENT_URL || (PUBLIC_API_BASE ? `${PUBLIC_API_BASE}/api/robot/event` : ''));
+const PUBLIC_API_BASE = normalizeBaseUrl(process.env.PUBLIC_API_BASE || process.env.ROBOT_EVENT_BASE || '');
+const DEFAULT_ROBOT_EVENT_URL = normalizeBaseUrl(
+  process.env.ROBOT_EVENT_URL ||
+    (PUBLIC_API_BASE ? `${PUBLIC_API_BASE}/api/robot/event` : ''),
+  { allowHttp: false }
+);
+
+const SESSION_COOKIE_ENABLED =
+  (process.env.SESSION_COOKIE_ENABLED || process.env.AAMS_SESSION_ENABLED || '0') === '1';
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'aams_session';
+const SESSION_COOKIE_DOMAIN = process.env.SESSION_COOKIE_DOMAIN || undefined;
+const SESSION_COOKIE_PATH = process.env.SESSION_COOKIE_PATH || '/';
+const sessionMaxAgeRaw = Number(process.env.SESSION_COOKIE_MAX_AGE || 7 * 24 * 60 * 60 * 1000);
+const SESSION_COOKIE_MAX_AGE = Number.isFinite(sessionMaxAgeRaw) && sessionMaxAgeRaw > 0
+  ? sessionMaxAgeRaw
+  : 7 * 24 * 60 * 60 * 1000;
+const SESSION_COOKIE_SECURE = (process.env.SESSION_COOKIE_SECURE || '1') !== '0';
+const rawSameSite = (process.env.SESSION_COOKIE_SAMESITE || 'none').toLowerCase();
+const allowedSameSite = new Set(['lax', 'strict', 'none']);
+const SESSION_COOKIE_SAME_SITE = allowedSameSite.has(rawSameSite) ? rawSameSite : 'none';
+const SESSION_COOKIE_HTTP_ONLY = (process.env.SESSION_COOKIE_HTTP_ONLY || '1') !== '0';
+
+const allowInsecureBridgeHints = (process.env.ALLOW_INSECURE_BRIDGE_HINTS || '') === '1';
+
+if (SESSION_COOKIE_ENABLED && SESSION_COOKIE_SAME_SITE === 'none' && !SESSION_COOKIE_SECURE) {
+  console.warn('[config] SESSION_COOKIE_SECURE=0 is incompatible with SameSite=None. Cookie will not be set over HTTPS.');
+}
 
 async function fetchLocalBridge(pathname, options = {}, { timeoutMs = 5000 } = {}) {
   if (!LOCAL_BRIDGE_URL) {
@@ -114,11 +335,19 @@ async function checkLocalBridgeHealth() {
 
 app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
 
-// CORS 설정: 모든 도메인에서의 요청을 허용
-app.use(cors());
+// CORS 설정: 환경 변수 기반 화이트리스트, 기본값은 개발 편의를 위해 허용
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use((err, req, res, next) => {
+  if (err && err.message === 'Origin not allowed by CORS policy') {
+    return res.status(403).json({ error: 'cors_not_allowed' });
+  }
+  return next(err);
+});
 
 // ⬇⬇ 추가: 프론트에서 보내는 JSON 바디를 파싱 (POST/PUT에 필수)
 app.use(express.json());
+app.use(attachSession);
 
 // 데이터베이스 연결 설정
 const pool = new Pool({
@@ -191,20 +420,62 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'invalid credentials' });
     }
 
-    // 필요한 최소 정보만 프론트에 전달
-    return res.json({
+    let sessionMeta = null;
+    if (SESSION_COOKIE_ENABLED) {
+      const session = registerSession({
+        userId: u.id,
+        personId: u.id,
+        name: u.name,
+        isAdmin: !!u.is_admin
+      });
+      sessionMeta = { exp: session.exp };
+      res.cookie(SESSION_COOKIE_NAME, session.id, {
+        httpOnly: SESSION_COOKIE_HTTP_ONLY,
+        secure: SESSION_COOKIE_SECURE,
+        sameSite: SESSION_COOKIE_SAME_SITE,
+        domain: SESSION_COOKIE_DOMAIN,
+        path: SESSION_COOKIE_PATH,
+        maxAge: SESSION_COOKIE_MAX_AGE
+      });
+    }
+
+    const payload = {
       id: u.id,
       name: u.name,
       user_id: u.user_id,
       is_admin: u.is_admin,
       rank: u.rank,
       unit: u.unit,
-      position: u.position,
-    });
+      position: u.position
+    };
+    if (sessionMeta) {
+      payload.session = {
+        expires_at: new Date(sessionMeta.exp).toISOString()
+      };
+    }
+
+    return res.json(payload);
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'login failed' });
   }
+});
+
+app.post('/api/logout', (req, res) => {
+  if (SESSION_COOKIE_ENABLED) {
+    const sessionId = extractSessionId(req);
+    if (sessionId) {
+      destroySession(sessionId);
+    }
+    res.clearCookie(SESSION_COOKIE_NAME, {
+      httpOnly: SESSION_COOKIE_HTTP_ONLY,
+      secure: SESSION_COOKIE_SECURE,
+      sameSite: SESSION_COOKIE_SAME_SITE,
+      domain: SESSION_COOKIE_DOMAIN,
+      path: SESSION_COOKIE_PATH
+    });
+  }
+  res.json({ ok: true });
 });
 
 
@@ -2213,7 +2484,21 @@ app.post('/api/robot/event', async (req, res) => {
 // server.js 하단에 추가/완성
 const sseClients = new Map(); // site -> Set(res)
 const lastEvent  = new Map(); // site -> last json
+const bridgePresence = new Map(); // site -> { hints, addresses, hostname, port, lastSeen, base }
+const BRIDGE_PRESENCE_TTL_MS = Number(process.env.BRIDGE_PRESENCE_TTL_MS || 5 * 60 * 1000);
 
+function pruneBridgePresence(now = Date.now()) {
+  for (const [site, info] of bridgePresence.entries()) {
+    if (!info) {
+      bridgePresence.delete(site);
+      continue;
+    }
+    const age = now - (info.lastSeenTs || 0);
+    if (age > BRIDGE_PRESENCE_TTL_MS) {
+      bridgePresence.delete(site);
+    }
+  }
+}
 function pushToSse(site, payload){
   const set = sseClients.get(site);
   if (!set) return;
@@ -2229,6 +2514,60 @@ app.post('/api/fp/event', async (req, res) => {
     }
     const { site = 'default', data } = req.body || {};
     if (!data) return res.status(400).json({ ok:false, error:'missing data' });
+
+    if (data?.type === 'bridge_presence') {
+      const nowTs = Date.now();
+      pruneBridgePresence(nowTs);
+      const hints = Array.isArray(data.urlHints)
+        ? data.urlHints
+            .map((value) => {
+              try {
+                return String(value).trim();
+              } catch {
+                return null;
+              }
+            })
+            .map((value) =>
+              value ? sanitizeHttpsUrl(value, { allowHttp: allowInsecureBridgeHints }) : ''
+            )
+            .filter(Boolean)
+        : [];
+      const addresses = Array.isArray(data.addresses)
+        ? data.addresses.map((entry) => {
+            if (!entry) return null;
+            const out = {};
+            if (entry.address) out.address = String(entry.address);
+            if (entry.interface) out.interface = String(entry.interface);
+            if (entry.family) out.family = String(entry.family);
+            if (entry.scopeid !== undefined && entry.scopeid !== null) out.scopeid = entry.scopeid;
+            if (entry.internal !== undefined) out.internal = !!entry.internal;
+            if (entry.mac) out.mac = String(entry.mac);
+            if (entry.netmask) out.netmask = String(entry.netmask);
+            return Object.keys(out).length ? out : null;
+          }).filter(Boolean)
+        : [];
+      const hostname = typeof data.hostname === 'string' ? data.hostname.trim() : '';
+      const rawBase = typeof data.base === 'string' ? data.base.trim() : '';
+      const base = rawBase
+        ? sanitizeHttpsUrl(rawBase, { allowHttp: allowInsecureBridgeHints })
+        : '';
+      const port = Number(data.port) || null;
+      const entry = {
+        site,
+        urlHints: hints,
+        addresses,
+        hostname: hostname || null,
+        base: base || null,
+        port,
+        lastSeen: new Date(nowTs).toISOString(),
+        lastSeenTs: nowTs,
+        reason: data.reason || null,
+        source: 'forward',
+        forwardedFor: req.get('x-forwarded-for') || req.ip || null
+      };
+      bridgePresence.set(site, entry);
+      return res.json({ ok: true });
+    }
 
     // 매핑 해석 (identify 성공시에만)
     let resolved = null;
@@ -2264,6 +2603,54 @@ app.post('/api/fp/event', async (req, res) => {
   }
 });
 
+app.get('/api/fp/bridge/hints', (req, res) => {
+  const site = String(req.query.site || 'default');
+  const allRaw = String(req.query.all || '').toLowerCase();
+  const includeAll = allRaw === '1' || allRaw === 'true' || allRaw === 'yes';
+  const maxAgeMsRaw = Number(req.query.maxAgeMs || req.query.max_age_ms || 0);
+  const effectiveTtl = Number.isFinite(maxAgeMsRaw) && maxAgeMsRaw > 0 ? maxAgeMsRaw : BRIDGE_PRESENCE_TTL_MS;
+  const nowTs = Date.now();
+  pruneBridgePresence(nowTs);
+
+  const isFresh = (info) => !!info && (nowTs - (info.lastSeenTs || 0)) <= effectiveTtl;
+  const sanitize = (siteKey, info) => ({
+    site: siteKey,
+    hints: Array.isArray(info?.urlHints) ? info.urlHints : [],
+    addresses: Array.isArray(info?.addresses) ? info.addresses : [],
+    hostname: info?.hostname || null,
+    base: info?.base || null,
+    port: info?.port || null,
+    last_seen: info?.lastSeen || null,
+    reason: info?.reason || null
+  });
+
+  if (includeAll) {
+    const entries = [];
+    for (const [key, value] of bridgePresence.entries()) {
+      if (!isFresh(value)) continue;
+      entries.push(sanitize(key, value));
+    }
+    return res.json({ ok: true, ttlMs: effectiveTtl, sites: entries });
+  }
+
+  const entry = bridgePresence.get(site);
+  if (!isFresh(entry)) {
+    return res.json({
+      ok: false,
+      site,
+      hints: [],
+      addresses: [],
+      hostname: null,
+      base: null,
+      port: null,
+      last_seen: null,
+      reason: null,
+      ttlMs: effectiveTtl
+    });
+  }
+
+  return res.json({ ok: true, ttlMs: effectiveTtl, ...sanitize(site, entry) });
+});
 
 
 // UI ← Render (SSE 실시간 스트림)
