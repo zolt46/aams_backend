@@ -91,7 +91,6 @@ const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, 
 const now = () => Date.now();
 const TICKET_TTL_MS = 1_000; // 10초
 
- 
 const SESSION_COOKIE_ENABLED =
   (process.env.SESSION_COOKIE_ENABLED || process.env.AAMS_SESSION_ENABLED || '0') === '1';
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'aams_session';
@@ -107,7 +106,6 @@ const allowedSameSite = new Set(['lax', 'strict', 'none']);
 const SESSION_COOKIE_SAME_SITE = allowedSameSite.has(rawSameSite) ? rawSameSite : 'none';
 const SESSION_COOKIE_HTTP_ONLY = (process.env.SESSION_COOKIE_HTTP_ONLY || '1') !== '0';
 
- 
 const sessionStore = new Map();
 
 function generateSessionId() {
@@ -279,6 +277,56 @@ if (!LOCAL_BRIDGE_URL && rawLocalBridgeUrl) {
     '[config] LOCAL_BRIDGE_URL ignored because it must be an HTTPS endpoint. Set ALLOW_INSECURE_LOCAL_BRIDGE=1 for development.'
   );
 }
+
+function normalizeSiteKey(rawSite) {
+  if (typeof rawSite !== 'string') return 'default';
+  const trimmed = rawSite.trim();
+  if (!trimmed) return 'default';
+  return trimmed
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'default';
+}
+
+const defaultBridgeSite = normalizeSiteKey(
+  process.env.LOCAL_BRIDGE_SITE || process.env.DEFAULT_FP_SITE || 'default'
+);
+
+function registerBridgeUrl(map, siteKey, rawUrl) {
+  if (!rawUrl) return;
+  const sanitized = normalizeBaseUrl(rawUrl, { allowHttp: allowInsecureBridge });
+  if (!sanitized) {
+    console.warn('[config] 사이트', siteKey, '용 브릿지 URL이 HTTPS가 아니라서 무시되었습니다.');
+    return;
+  }
+  map.set(siteKey, sanitized);
+}
+
+const configuredBridgeUrls = (() => {
+  const map = new Map();
+  if (LOCAL_BRIDGE_URL) {
+    map.set(defaultBridgeSite, LOCAL_BRIDGE_URL);
+  }
+  for (const [key, value] of Object.entries(process.env)) {
+    const match = key.match(/^(?:LOCAL_BRIDGE_URL|FP_LOCAL_BRIDGE_URL|ROBOT_BRIDGE_URL)__([A-Z0-9_\-]+)$/i);
+    if (!match) continue;
+    const siteKey = normalizeSiteKey(match[1]);
+    registerBridgeUrl(map, siteKey, value);
+  }
+  return map;
+})();
+
+function resolveConfiguredBridgeBase(siteKey) {
+  const normalized = normalizeSiteKey(siteKey || defaultBridgeSite);
+  if (configuredBridgeUrls.has(normalized)) {
+    return configuredBridgeUrls.get(normalized);
+  }
+  if (configuredBridgeUrls.has(defaultBridgeSite)) {
+    return configuredBridgeUrls.get(defaultBridgeSite);
+  }
+  return '';
+}
 const LOCAL_BRIDGE_TOKEN = process.env.LOCAL_BRIDGE_TOKEN || process.env.ROBOT_BRIDGE_TOKEN || '';
 const ROBOT_EVENT_TOKEN = process.env.ROBOT_SITE_TOKEN || process.env.FP_SITE_TOKEN || '';
 const PUBLIC_API_BASE = normalizeBaseUrl(process.env.PUBLIC_API_BASE || process.env.ROBOT_EVENT_BASE || '');
@@ -288,7 +336,6 @@ const DEFAULT_ROBOT_EVENT_URL = normalizeBaseUrl(
   { allowHttp: false }
 );
 
- 
 const allowInsecureBridgeHints = (process.env.ALLOW_INSECURE_BRIDGE_HINTS || '') === '1';
 
 if (SESSION_COOKIE_ENABLED && SESSION_COOKIE_SAME_SITE === 'none' && !SESSION_COOKIE_SECURE) {
@@ -2616,15 +2663,18 @@ app.get('/api/fp/bridge/hints', (req, res) => {
   pruneBridgePresence(nowTs);
 
   const isFresh = (info) => !!info && (nowTs - (info.lastSeenTs || 0)) <= effectiveTtl;
-  const sanitize = (siteKey, info) => ({
+  const sanitize = (siteKey, info, { fallbackBase = '' } = {}) => ({
     site: siteKey,
-    hints: Array.isArray(info?.urlHints) ? info.urlHints : [],
+    hints: Array.isArray(info?.urlHints) && info.urlHints.length
+      ? info.urlHints
+      : (fallbackBase ? [fallbackBase] : []),
     addresses: Array.isArray(info?.addresses) ? info.addresses : [],
     hostname: info?.hostname || null,
-    base: info?.base || null,
+    base: info?.base || fallbackBase || null,
     port: info?.port || null,
     last_seen: info?.lastSeen || null,
-    reason: info?.reason || null
+    reason: info?.reason || null,
+    source: info?.source || (fallbackBase ? 'config' : null)
   });
 
   if (includeAll) {
@@ -2633,11 +2683,25 @@ app.get('/api/fp/bridge/hints', (req, res) => {
       if (!isFresh(value)) continue;
       entries.push(sanitize(key, value));
     }
+    if (!entries.length) {
+      const fallbackBase = resolveConfiguredBridgeBase(site);
+      if (fallbackBase) {
+        entries.push(sanitize(site, null, { fallbackBase }));
+      }
+    }
     return res.json({ ok: true, ttlMs: effectiveTtl, sites: entries });
   }
 
   const entry = bridgePresence.get(site);
   if (!isFresh(entry)) {
+    const fallbackBase = resolveConfiguredBridgeBase(site);
+    if (fallbackBase) {
+      return res.json({
+        ok: true,
+        ttlMs: effectiveTtl,
+        ...sanitize(site, null, { fallbackBase })
+      });
+    }
     return res.json({
       ok: false,
       site,
@@ -2653,6 +2717,50 @@ app.get('/api/fp/bridge/hints', (req, res) => {
   }
 
   return res.json({ ok: true, ttlMs: effectiveTtl, ...sanitize(site, entry) });
+});
+
+
+function detectRequestOrigin(req) {
+  const forwardedHost = req.get('x-forwarded-host');
+  const host = forwardedHost || req.get('host');
+  if (!host) return '';
+  const protoHeader = req.get('x-forwarded-proto') || req.get('x-forwarded-protocol');
+  let proto = protoHeader || req.protocol || 'https';
+  if (proto.includes(',')) {
+    proto = proto.split(',')[0].trim();
+  }
+  proto = proto.replace(/:.*/, '').trim() || 'https';
+  const candidate = `${proto}://${host}`;
+  try {
+    return new URL(candidate).origin;
+  } catch (_) {
+    return '';
+  }
+}
+
+app.get('/api/tab/env.json', (req, res) => {
+  const site = String(req.query.site || 'default');
+  const entry = bridgePresence.get(site);
+  const fallbackBase = resolveConfiguredBridgeBase(site);
+  const resolvedBase = entry?.base || fallbackBase || '';
+  const apiBase = PUBLIC_API_BASE || detectRequestOrigin(req) || '';
+  const envPayload = {};
+  if (apiBase) envPayload.API_BASE = apiBase;
+  if (resolvedBase) envPayload.LOCAL_FP_BASE = resolvedBase;
+  envPayload.FP_SITE = normalizeSiteKey(site);
+
+  const bridgeInfo = {
+    configured: !!resolvedBase,
+    source: entry?.source || (resolvedBase ? 'config' : null)
+  };
+  if (entry?.urlHints?.length) {
+    bridgeInfo.hints = entry.urlHints;
+  } else if (resolvedBase) {
+    bridgeInfo.hints = [resolvedBase];
+  }
+
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.json({ ok: true, env: envPayload, bridge: bridgeInfo });
 });
 
 
