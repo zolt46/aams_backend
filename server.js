@@ -2548,59 +2548,13 @@ server.keepAliveTimeout = 0;
 server.headersTimeout = 65_000;
 
 const wss = new WebSocketServer({
-  noServer: true,
+  server,
+  path: '/ws',
   perMessageDeflate: false
 });
 
-const WS_PATHS = new Set(['/ws', '/ws/']);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
 
-function parseUpgradePath(req) {
-  try {
-    const base = req.headers.host ? `http://${req.headers.host}` : 'http://localhost';
-    const { pathname } = new URL(req.url, base);
-    return pathname;
-  } catch (err) {
-    return null;
-  }
-}
-
-function rejectSocket(socket, status = 400, message = 'Bad Request') {
-  try {
-    socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`);
-  } catch (_) {
-    // ignore write errors
-  }
-  try { socket.destroy(); }
-  catch (_) {}
-}
-
-server.on('upgrade', (req, socket, head) => {
-  const upgradeHeader = String(req.headers['upgrade'] || '').toLowerCase();
-  if (upgradeHeader !== 'websocket') {
-    rejectSocket(socket, 426, 'Upgrade Required');
-    return;
-  }
-
-  const pathname = parseUpgradePath(req);
-  if (!pathname || !WS_PATHS.has(pathname)) {
-    rejectSocket(socket, 404, 'Not Found');
-    return;
-  }
-
-  socket.on('error', (err) => {
-    console.error('[ws] socket error before upgrade:', err?.message || err);
-  });
-
-  try {
-    wss.handleUpgrade(req, socket, head, (client) => {
-      wss.emit('connection', client, req);
-    });
-  } catch (err) {
-    console.error('[ws] upgrade failed:', err?.message || err);
-    rejectSocket(socket, 500, 'Internal Server Error');
-  }
-});
 
 server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
