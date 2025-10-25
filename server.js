@@ -2552,44 +2552,12 @@ server.keepAliveTimeout = 61_000;
 server.headersTimeout = 65_000;
 
 const wss = new WebSocketServer({
-  noServer: true,
+  server,
+  path: '/ws',
   perMessageDeflate: false
 });
 
-server.on('upgrade', (req, socket, head) => {
-  const destroy = (code, message) => {
-    try {
-      if (code) {
-        const body = message ? String(message) : '';
-        socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
-      }
-    } catch (_) { /* noop */ }
-    try { socket.destroy(); }
-    catch (_) { /* noop */ }
-  };
-
-  let pathname = '';
-  try {
-    const url = new URL(req.url || '', 'http://localhost');
-    pathname = url.pathname || '';
-  } catch (err) {
-    destroy('400 Bad Request', 'Bad Request');
-    return;
-  }
-
-  if (pathname !== '/ws' && pathname !== '/ws/') {
-    destroy('404 Not Found', 'Not Found');
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
-  });
-});
-
-
 const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
-
 
 server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
