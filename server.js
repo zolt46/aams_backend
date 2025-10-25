@@ -2546,7 +2546,7 @@ const server = app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
   let authenticated = false;
