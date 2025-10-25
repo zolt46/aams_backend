@@ -281,8 +281,14 @@ async function checkLocalBridgeHealth() {
 
 app.use(express.static(path.join(__dirname))); // ★ 이 줄 추가
 
-// CORS 설정: 모든 도메인에서의 요청을 허용
-app.use(cors());
+// CORS 설정: GitHub Pages 및 로컬 테스트 환경 명시적 허용
+app.use(cors({
+  origin: [
+    'https://zolt46.github.io', // GitHub Pages
+    'http://127.0.0.1:5500',   // 로컬 테스트용
+    'http://localhost:5500'    // 로컬 테스트용
+  ]
+}));
 
 // ⬇⬇ 추가: 프론트에서 보내는 JSON 바디를 파싱 (POST/PUT에 필수)
 app.use(express.json());
