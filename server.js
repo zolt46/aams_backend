@@ -2544,39 +2544,91 @@ app.post('/api/fp/invalidate', (req,res)=>{
 });
 
 const server = http.createServer(app);
+server.keepAliveTimeout = 0;
+server.headersTimeout = 65_000;
 
 const wss = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false
 });
 
-server.on('upgrade', (req, socket, head) => {
-  let pathname = '';
+const WS_PATHS = new Set(['/ws', '/ws/']);
+const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
+
+function parseUpgradePath(req) {
   try {
-    const { pathname: parsed } = new URL(req.url, 'http://localhost');
-    pathname = parsed;
+    const base = req.headers.host ? `http://${req.headers.host}` : 'http://localhost';
+    const { pathname } = new URL(req.url, base);
+    return pathname;
+  } catch (err) {
+    return null;
+  }
+}
+
+function rejectSocket(socket, status = 400, message = 'Bad Request') {
+  try {
+    socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`);
   } catch (_) {
-    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-    socket.destroy();
+    // ignore write errors
+  }
+  try { socket.destroy(); }
+  catch (_) {}
+}
+
+server.on('upgrade', (req, socket, head) => {
+  const upgradeHeader = String(req.headers['upgrade'] || '').toLowerCase();
+  if (upgradeHeader !== 'websocket') {
+    rejectSocket(socket, 426, 'Upgrade Required');
     return;
   }
 
-  if (pathname !== '/ws' && pathname !== '/ws/') {
-    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-    socket.destroy();
+  const pathname = parseUpgradePath(req);
+  if (!pathname || !WS_PATHS.has(pathname)) {
+    rejectSocket(socket, 404, 'Not Found');
     return;
   }
 
-  wss.handleUpgrade(req, socket, head, (client) => {
-    wss.emit('connection', client, req);
+  socket.on('error', (err) => {
+    console.error('[ws] socket error before upgrade:', err?.message || err);
   });
+
+  try {
+    wss.handleUpgrade(req, socket, head, (client) => {
+      wss.emit('connection', client, req);
+    });
+  } catch (err) {
+    console.error('[ws] upgrade failed:', err?.message || err);
+    rejectSocket(socket, 500, 'Internal Server Error');
+  }
 });
 
 server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
 
+if (HEARTBEAT_INTERVAL_MS > 0) {
+  const beat = () => {
+    wss.clients.forEach((client) => {
+      if (client.isAlive === false) {
+        cleanupConnection(client);
+        try { client.terminate(); }
+        catch (_) {}
+        return;
+      }
+      client.isAlive = false;
+      try { client.ping(); }
+      catch (err) { console.warn('[ws] ping failed:', err?.message || err); }
+    });
+  };
+  const heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+  wss.on('close', () => clearInterval(heartbeatTimer));
+}
+
 wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws.on('pong', function handlePong() {
+    this.isAlive = true;
+  });
   let authenticated = false;
   let role = null;
   let site = 'default';
@@ -2593,6 +2645,7 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('message', async (data) => {
+    ws.isAlive = true;
     const text = typeof data === 'string' ? data : data?.toString?.();
     if (!text) return;
     let message;
