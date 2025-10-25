@@ -1,6 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const http = require('http');
 const WebSocket = require('ws');
 const { WebSocketServer } = WebSocket;
 require('dotenv').config();
@@ -2542,11 +2543,45 @@ app.post('/api/fp/invalidate', (req,res)=>{
   res.json({ ok:true });
 });
 
-const server = app.listen(port, () => {
+app.get('/ws', (req, res) => {
+  res.status(426).json({ error: 'upgrade_required' });
+});
+
+const server = http.createServer(app);
+
+server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  let pathname = '/';
+  try {
+    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+    pathname = url.pathname || '/';
+  } catch (_) {
+    pathname = '/';
+  }
+
+  if (pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  try {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } catch (err) {
+    console.error('[ws] upgrade failed:', err?.message || err);
+    try {
+      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+    } catch (_) {}
+    socket.destroy();
+  }
+});
 
 wss.on('connection', (ws) => {
   let authenticated = false;
