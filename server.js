@@ -287,6 +287,10 @@ app.use(cors());
 // ⬇⬇ 추가: 프론트에서 보내는 JSON 바디를 파싱 (POST/PUT에 필수)
 app.use(express.json());
 
+app.get(['/ws', '/ws/'], (_req, res) => {
+  res.status(426).json({ error: 'upgrade_required' });
+});
+
 // 데이터베이스 연결 설정
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -2544,14 +2548,45 @@ app.post('/api/fp/invalidate', (req,res)=>{
 });
 
 const server = http.createServer(app);
-server.keepAliveTimeout = 0;
+server.keepAliveTimeout = 61_000;
 server.headersTimeout = 65_000;
 
 const wss = new WebSocketServer({
-  server,
-  path: '/ws',
+  noServer: true,
   perMessageDeflate: false
 });
+
+server.on('upgrade', (req, socket, head) => {
+  const destroy = (code, message) => {
+    try {
+      if (code) {
+        const body = message ? String(message) : '';
+        socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      }
+    } catch (_) { /* noop */ }
+    try { socket.destroy(); }
+    catch (_) { /* noop */ }
+  };
+
+  let pathname = '';
+  try {
+    const url = new URL(req.url || '', 'http://localhost');
+    pathname = url.pathname || '';
+  } catch (err) {
+    destroy('400 Bad Request', 'Bad Request');
+    return;
+  }
+
+  if (pathname !== '/ws' && pathname !== '/ws/') {
+    destroy('404 Not Found', 'Not Found');
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
 
 const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
 
@@ -2577,6 +2612,10 @@ if (HEARTBEAT_INTERVAL_MS > 0) {
   const heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
   wss.on('close', () => clearInterval(heartbeatTimer));
 }
+
+wss.on('error', (err) => {
+  console.error('[ws] server error:', err?.message || err);
+});
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
