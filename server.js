@@ -2546,12 +2546,30 @@ app.post('/api/fp/invalidate', (req,res)=>{
 const server = http.createServer(app);
 
 const wss = new WebSocketServer({
-  server,
-  path: '/ws',
-  perMessageDeflate: {
-    serverNoContextTakeover: true,
-    clientNoContextTakeover: true
+  noServer: true,
+  perMessageDeflate: false
+});
+
+server.on('upgrade', (req, socket, head) => {
+  let pathname = '';
+  try {
+    const { pathname: parsed } = new URL(req.url, 'http://localhost');
+    pathname = parsed;
+  } catch (_) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
   }
+
+  if (pathname !== '/ws' && pathname !== '/ws/') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (client) => {
+    wss.emit('connection', client, req);
+  });
 });
 
 server.listen(port, () => {
