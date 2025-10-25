@@ -2545,50 +2545,34 @@ app.post('/api/fp/invalidate', (req,res)=>{
 
 const server = http.createServer(app);
 
-const wss = new WebSocketServer({ noServer: true });
-
-function rejectUpgrade(socket, statusCode, reason) {
-  try {
-    socket.write(`HTTP/1.1 ${statusCode} ${reason}\r\nConnection: close\r\n\r\n`);
-  } catch (_) {
-    // ignore write errors
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  perMessageDeflate: {
+    serverNoContextTakeover: true,
+    clientNoContextTakeover: true
   }
-  try { socket.destroy(); } catch (_) {}
-}
-
-server.on('upgrade', (req, socket, head) => {
-  const upgradeHeader = String(req.headers['upgrade'] || '').toLowerCase();
-  if (upgradeHeader !== 'websocket') {
-    rejectUpgrade(socket, 426, 'Upgrade Required');
-    return;
-  }
-
-  let pathname = '/';
-  try {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    pathname = url.pathname || '/';
-  } catch (_) {
-    pathname = (req.url && req.url.split('?')[0]) || '/';
-  }
-
-  if (pathname !== '/ws' && pathname !== '/ws/') {
-    rejectUpgrade(socket, 404, 'Not Found');
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (client) => {
-    wss.emit('connection', client, req);
-  });
 });
 
 server.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let authenticated = false;
   let role = null;
   let site = 'default';
+
+  if (req && req.url) {
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      if (url.searchParams.has('site')) {
+        site = toSiteKey(url.searchParams.get('site'));
+      }
+    } catch (_) {
+      // ignore malformed url
+    }
+  }
 
   ws.on('message', async (data) => {
     const text = typeof data === 'string' ? data : data?.toString?.();
