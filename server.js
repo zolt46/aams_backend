@@ -1,6 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const WebSocket = require('ws');
+const { WebSocketServer } = WebSocket;
 require('dotenv').config();
 
 const app = express();
@@ -8,6 +10,169 @@ const port = process.env.PORT || 3000;
 const path = require('path');
 
 const loginTickets = new Map(); // key: site, val: { person_id, name, is_admin, exp, used:false }
+const lastEvent = new Map(); // site -> last fingerprint payload
+const lastStatus = new Map(); // site -> last FP_STATUS payload
+const lastHealth = new Map(); // site -> last FP_HEALTH payload
+const uiConnections = new Map();
+const bridgeConnections = new Map();
+const connectionSites = new Map();
+
+function toSiteKey(value) {
+  const site = typeof value === 'string' ? value.trim() : '';
+  return site || 'default';
+}
+
+function closeSilently(ws, code, reason) {
+  try { ws.close(code, reason); }
+  catch (_) {}
+}
+
+function sendJson(ws, message) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    ws.send(JSON.stringify(message));
+    return true;
+  } catch (err) {
+    console.warn('[ws] send failed:', err?.message || err);
+    return false;
+  }
+}
+
+function trackConnection(ws, meta) {
+  connectionSites.set(ws, meta);
+  const { type, site } = meta;
+  if (type === 'ui') {
+    const existing = uiConnections.get(site);
+    if (existing && existing !== ws) {
+      closeSilently(existing, 4000, 'ui replaced');
+    }
+    uiConnections.set(site, ws);
+  } else if (type === 'bridge') {
+    const existing = bridgeConnections.get(site);
+    if (existing && existing !== ws) {
+      closeSilently(existing, 4000, 'bridge replaced');
+    }
+    bridgeConnections.set(site, ws);
+  }
+}
+
+function cleanupConnection(ws) {
+  const meta = connectionSites.get(ws);
+  if (!meta) return;
+  const { type, site } = meta;
+  if (type === 'ui' && uiConnections.get(site) === ws) {
+    uiConnections.delete(site);
+  }
+  if (type === 'bridge' && bridgeConnections.get(site) === ws) {
+    bridgeConnections.delete(site);
+  }
+  connectionSites.delete(ws);
+}
+
+function forwardToUi(site, message) {
+  const target = uiConnections.get(site);
+  if (!target) return false;
+  return sendJson(target, { ...message, site });
+}
+
+function forwardToBridge(site, message) {
+  const target = bridgeConnections.get(site);
+  if (!target) return false;
+  return sendJson(target, { ...message, site });
+}
+
+async function buildFingerprintPayload(site, data) {
+  let resolved = null;
+  if (data && data.ok === true && data.type === 'identify' && Number.isInteger(data.matchId)) {
+    try {
+      const q = `SELECT t.person_id, p.name, p.is_admin
+                   FROM fp_templates t JOIN personnel p ON p.id=t.person_id
+                   WHERE t.sensor_id=$1 AND t.site=$2 LIMIT 1`;
+      const r = await pool.query(q, [data.matchId, site]);
+      if (r.rowCount) {
+        const row = r.rows[0];
+        resolved = { person_id: row.person_id, name: row.name, is_admin: !!row.is_admin };
+        loginTickets.set(site, {
+          person_id: resolved.person_id,
+          name: resolved.name,
+          is_admin: !!resolved.is_admin,
+          exp: now() + TICKET_TTL_MS,
+          used: false,
+          issued_at: now()
+        });
+      }
+    } catch (err) {
+      console.error('[fp] resolve failed:', err?.message || err);
+    }
+  }
+
+  const payload = { site, data, resolved, received_at: new Date().toISOString() };
+  lastEvent.set(site, payload);
+  return payload;
+}
+
+async function handleBridgeMessage(site, message, ws) {
+  if (!message || typeof message !== 'object') return;
+  const type = message.type;
+  if (!type) return;
+
+  if (type === 'FP_EVENT') {
+    const data = message.payload ?? message.data ?? null;
+    const payload = await buildFingerprintPayload(site, data);
+    forwardToUi(site, { type: 'FP_EVENT', payload });
+    return;
+  }
+
+  if (type === 'ROBOT_EVENT') {
+    const job = message.job || message.payload || null;
+    try {
+      if (job) {
+        const requestId = job.requestId || job.request_id || job.requestID || null;
+        const status = message.status || job.status || null;
+        if (requestId && status) {
+          await handleRobotEvent({ requestId, status, job, site });
+        }
+      }
+    } catch (err) {
+      console.error('robot event handling failed:', err?.message || err);
+    }
+    forwardToUi(site, message);
+    return;
+  }
+
+  if (['FP_SESSION_STARTED', 'FP_SESSION_STOPPED', 'FP_SESSION_ERROR', 'LED_STATUS'].includes(type)) {
+    forwardToUi(site, message);
+    return;
+  }
+
+  if (type === 'FP_STATUS') {
+    lastStatus.set(site, { ...message, site });
+    forwardToUi(site, message);
+    return;
+  }
+
+  if (type === 'FP_HEALTH') {
+    lastHealth.set(site, { ...message, site });
+    forwardToUi(site, message);
+    return;
+  }
+
+  if (['FP_ENROLL_RESULT', 'FP_DELETE_RESULT', 'FP_CLEAR_RESULT', 'FP_COUNT_RESULT', 'FP_HEALTH_ERROR'].includes(type)) {
+    forwardToUi(site, message);
+    return;
+  }
+
+  if (type === 'PONG') {
+    return;
+  }
+
+  // Default relay
+  if (!forwardToUi(site, message)) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      sendJson(ws, { type: 'WARN', reason: 'ui_unavailable', site });
+    }
+  }
+}
 const now = () => Date.now();
 const TICKET_TTL_MS = 1_000; // 10초
 
@@ -67,6 +232,7 @@ function trimSlash(value = '') {
 
 const LOCAL_BRIDGE_URL = trimSlash(process.env.LOCAL_BRIDGE_URL || process.env.ROBOT_BRIDGE_URL || process.env.FP_LOCAL_BRIDGE_URL || '');
 const LOCAL_BRIDGE_TOKEN = process.env.LOCAL_BRIDGE_TOKEN || process.env.ROBOT_BRIDGE_TOKEN || '';
+const BRIDGE_AUTH_TOKEN = process.env.FP_SITE_TOKEN || LOCAL_BRIDGE_TOKEN || '';
 const ROBOT_EVENT_TOKEN = process.env.ROBOT_SITE_TOKEN || process.env.FP_SITE_TOKEN || '';
 const PUBLIC_API_BASE = trimSlash(process.env.PUBLIC_API_BASE || process.env.ROBOT_EVENT_BASE || '');
 const DEFAULT_ROBOT_EVENT_URL = trimSlash(process.env.ROBOT_EVENT_URL || (PUBLIC_API_BASE ? `${PUBLIC_API_BASE}/api/robot/event` : ''));
@@ -2183,10 +2349,6 @@ app.get('/api/duty/rosters', async (req,res)=>{
   }catch(e){ console.error(e); res.status(500).json({error:'query failed'}); }
 });
 
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
-
 app.post('/api/robot/event', async (req, res) => {
   try {
     const token = req.get('x-robot-token') || req.get('x-fp-token');
@@ -2207,91 +2369,6 @@ app.post('/api/robot/event', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message || 'robot_event_failed' });
   }
 });
-
-
-// 로컬 브릿지 → Render (지문 이벤트 적재)
-// server.js 하단에 추가/완성
-const sseClients = new Map(); // site -> Set(res)
-const lastEvent  = new Map(); // site -> last json
-
-function pushToSse(site, payload){
-  const set = sseClients.get(site);
-  if (!set) return;
-  const data = `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of set) { try { res.write(data); } catch(_){} }
-}
-
-app.post('/api/fp/event', async (req, res) => {
-  try {
-    const token = req.get('x-fp-token');
-    if (token !== process.env.FP_SITE_TOKEN) {
-      return res.status(401).json({ ok:false, error:'unauthorized' });
-    }
-    const { site = 'default', data } = req.body || {};
-    if (!data) return res.status(400).json({ ok:false, error:'missing data' });
-
-    // 매핑 해석 (identify 성공시에만)
-    let resolved = null;
-    if (data.ok === true && data.type === 'identify' && Number.isInteger(data.matchId)) {
-      const q = `SELECT t.person_id, p.name, p.is_admin
-                 FROM fp_templates t JOIN personnel p ON p.id=t.person_id
-                 WHERE t.sensor_id=$1 AND t.site=$2 LIMIT 1`;
-      const r = await pool.query(q, [data.matchId, site]);
-      if (r.rowCount) {
-        const row = r.rows[0];
-        resolved = { person_id: row.person_id, name: row.name, is_admin: !!row.is_admin };
-        if (data.ok === true && data.type === 'identify' && resolved?.person_id) {
-          loginTickets.set(site, {
-            person_id: resolved.person_id,
-            name: resolved.name,
-            is_admin: !!resolved.is_admin,
-            exp: now() + TICKET_TTL_MS,
-            used: false,
-            issued_at: now()
-          });
-        }
-      }
-    }
-
-    const payload = { site, data, resolved, received_at: new Date().toISOString() };
-    lastEvent.set(site, payload);
-    pushToSse(site, payload);
-
-    return res.json({ ok:true });
-  } catch (e) {
-    console.error('fp/event error:', e);
-    res.status(500).json({ ok:false, error:'fp_event_failed' });
-  }
-});
-
-
-
-// UI ← Render (SSE 실시간 스트림)
-// SSE 스트림: /api/fp/stream?site=site-01
-app.get('/api/fp/stream', (req, res) => {
-  const site = (req.query.site || 'default');
-
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders?.();
-
-  if (!sseClients.has(site)) sseClients.set(site, new Set());
-  const set = sseClients.get(site);
-  set.add(res);
-
-  // 🔴 초기 lastEvent 1건 밀어주던 코드를 완전히 제거했습니다.
-
-  // heartbeat
-  const hb = setInterval(() => { try { res.write(':\n\n'); } catch (_) {} }, 30000);
-
-  req.on('close', () => {
-    clearInterval(hb);
-    try { set.delete(res); } catch (_){}
-  });
-});
-
 
 // 최근 1건 폴링 용(테스트/디버깅)
 app.get('/api/fp/last', (req, res) => {
@@ -2463,4 +2540,93 @@ app.post('/api/fp/invalidate', (req,res)=>{
   const site = (req.body && req.body.site) || 'default';
   loginTickets.delete(site);
   res.json({ ok:true });
+});
+
+const server = app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
+
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  let authenticated = false;
+  let role = null;
+  let site = 'default';
+
+  ws.on('message', async (data) => {
+    const text = typeof data === 'string' ? data : data?.toString?.();
+    if (!text) return;
+    let message;
+    try {
+      message = JSON.parse(text);
+    } catch (err) {
+      console.warn('[ws] invalid json message:', err?.message || err);
+      return;
+    }
+
+    if (!authenticated) {
+      if (message?.type === 'AUTH_UI') {
+        site = toSiteKey(message.site || site);
+        authenticated = true;
+        role = 'ui';
+        trackConnection(ws, { type: 'ui', site });
+        sendJson(ws, { type: 'AUTH_ACK', role: 'ui', site });
+        const last = lastEvent.get(site);
+        if (last) {
+          sendJson(ws, { type: 'FP_EVENT', payload: last, site });
+        }
+        const status = lastStatus.get(site);
+        if (status) {
+          sendJson(ws, { ...status });
+        }
+        const health = lastHealth.get(site);
+        if (health) {
+          sendJson(ws, { ...health });
+        }
+        return;
+      }
+      if (message?.type === 'AUTH_BRIDGE') {
+        if (BRIDGE_AUTH_TOKEN && message.token !== BRIDGE_AUTH_TOKEN) {
+          sendJson(ws, { type: 'ERROR', error: 'unauthorized', site });
+          closeSilently(ws, 4003, 'unauthorized');
+          return;
+        }
+        site = toSiteKey(message.site || site);
+        authenticated = true;
+        role = 'bridge';
+        trackConnection(ws, { type: 'bridge', site });
+        sendJson(ws, { type: 'AUTH_ACK', role: 'bridge', site });
+        return;
+      }
+      sendJson(ws, { type: 'ERROR', error: 'unauthorized', site });
+      closeSilently(ws, 4001, 'unauthorized');
+      return;
+    }
+
+    if (message.type === 'PING') {
+      sendJson(ws, { type: 'PONG', site, ts: Date.now() });
+      return;
+    }
+
+    if (role === 'ui') {
+      const targetSite = toSiteKey(message.site || site);
+      if (!forwardToBridge(targetSite, message)) {
+        sendJson(ws, { type: 'ERROR', error: 'bridge_unavailable', site: targetSite, requestId: message.requestId || null });
+      }
+      return;
+    }
+
+    if (role === 'bridge') {
+      const targetSite = toSiteKey(message.site || site);
+      await handleBridgeMessage(targetSite, message, ws);
+    }
+  });
+
+  ws.on('close', () => {
+    cleanupConnection(ws);
+  });
+
+  ws.on('error', (err) => {
+    console.error('[ws] client error:', err?.message || err);
+  });
 });
