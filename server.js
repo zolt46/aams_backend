@@ -1007,6 +1007,19 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     return { dispatch: mergedDispatch, items: itemsPayload, forward };
   }
 
+  function normalizeIncludesFlag(value, fallback = false) {
+    if (value === undefined || value === null) return fallback;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+      const trimmed = value.trim().toLowerCase();
+      if (!trimmed) return fallback;
+      if (['true', '1', 'yes', 'y', 'on'].includes(trimmed)) return true;
+      if (['false', '0', 'no', 'n', 'off'].includes(trimmed)) return false;
+    }
+    return !!value;
+  }
+
   function buildRobotDispatchPayload({ request, executor, executedBy, dispatch, eventId, items, forward }) {
     const requestSummary = pruneEmpty({
       id: request.id,
@@ -1033,6 +1046,46 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       ...(forward || {})
     });
 
+    const includes = dispatch?.includes || {};
+    const rawItems = Array.isArray(items) ? items : [];
+    const hasFirearm = normalizeIncludesFlag(
+      includes.firearm,
+      rawItems.some((entry) => String(entry?.item_type || entry?.type || '').toUpperCase() === 'FIREARM')
+    );
+    const hasAmmo = normalizeIncludesFlag(
+      includes.ammo,
+      rawItems.some((entry) => String(entry?.item_type || entry?.type || '').toUpperCase() === 'AMMO')
+    );
+
+    const direction = (() => {
+      const type = String(request.request_type || request.type || '').toUpperCase();
+      if (type === 'RETURN' || type === 'INBOUND') return 'in';
+      if (type === 'DISPATCH' || type === 'ISSUE' || type === 'OUTBOUND') return 'out';
+      const mode = String(dispatch?.mode || '').toLowerCase();
+      if (['return', 'in', '입고', '불입'].includes(mode)) return 'in';
+      return 'out';
+    })();
+
+    const locker = dispatch?.locker || request.storage_locker || requestSummary?.locker || null;
+    const firearmCode = dispatch?.firearm?.code
+      || dispatch?.firearm?.firearm_number
+      || request.weapon_code
+      || null;
+
+    const bridgePayload = pruneEmpty({
+      requestId: request.id,
+      direction,
+      locker,
+      mission: locker || null,
+      firearmSerial: firearmCode || null,
+      expectedQr: firearmCode || null,
+      includesAmmo: hasAmmo,
+      includesFirearm: hasFirearm,
+      firearmOnly: hasFirearm && !hasAmmo,
+      site: request.site_id || request.site || null,
+      requestType: request.request_type || request.type || null
+    });
+
     return pruneEmpty({
       requestId: request.id,
       executionEventId: eventId,
@@ -1046,7 +1099,8 @@ app.delete('/api/ammunition/:id', async (req, res) => {
       site: dispatch?.site_id || request.site_id || request.site || null,
       status: request.status || null,
       timestamp: new Date().toISOString(),
-      forward: forwardConfig
+      forward: forwardConfig,
+      bridgePayload
     });
   }
 
@@ -1119,10 +1173,11 @@ app.delete('/api/ammunition/:id', async (req, res) => {
     try {
       const headers = { 'content-type': 'application/json' };
       if (LOCAL_BRIDGE_TOKEN) headers['x-bridge-token'] = LOCAL_BRIDGE_TOKEN;
+      const bridgePayload = payload?.bridgePayload ? { ...payload.bridgePayload } : { ...payload };
       const res = await fetchLocalBridge('/robot/execute', {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload)
+        body: JSON.stringify(bridgePayload)
       });
       let data = null;
       try { data = await res.json(); } catch (_) { data = null; }
