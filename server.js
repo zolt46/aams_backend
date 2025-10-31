@@ -2933,6 +2933,52 @@ wss.on('connection', (ws, req) => {
 
     if (role === 'ui') {
       const targetSite = toSiteKey(message.site || site);
+      const msgType = message.type;
+
+      if (msgType === 'LOCKDOWN_STATUS_REQUEST') {
+        sendJson(ws, { type: 'LOCKDOWN_STATUS', site: targetSite, ...composeLockdownPayload() });
+        forwardToBridge(targetSite, message);
+        return;
+      }
+
+      if (msgType === 'LOCKDOWN_TRIGGER') {
+        try {
+          const payload = await activateLockdown({
+            actor: message.actor,
+            reason: message.reason,
+            message: message.message
+          });
+          sendJson(ws, { type: 'LOCKDOWN_STATUS', site: targetSite, ...payload, active: true });
+        } catch (err) {
+          sendJson(ws, {
+            type: 'ERROR',
+            error: 'lockdown_trigger_failed',
+            message: err?.message || 'lockdown trigger failed',
+            site: targetSite
+          });
+        }
+        return;
+      }
+
+      if (msgType === 'LOCKDOWN_RELEASE') {
+        try {
+          const payload = await releaseLockdown({
+            actor: message.actor,
+            reason: message.reason,
+            message: message.message
+          });
+          sendJson(ws, { type: 'LOCKDOWN_STATUS', site: targetSite, ...payload });
+        } catch (err) {
+          sendJson(ws, {
+            type: 'ERROR',
+            error: 'lockdown_release_failed',
+            message: err?.message || 'lockdown release failed',
+            site: targetSite
+          });
+        }
+        return;
+      }
+
       if (!forwardToBridge(targetSite, message)) {
         sendJson(ws, { type: 'ERROR', error: 'bridge_unavailable', site: targetSite, requestId: message.requestId || null });
       }
