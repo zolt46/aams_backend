@@ -18,6 +18,19 @@ const uiConnections = new Map();
 const bridgeConnections = new Map();
 const connectionSites = new Map();
 
+const lockdownState = {
+  active: false,
+  triggeredAt: null,
+  triggeredBy: null,
+  reason: null,
+  message: null,
+  clearedAt: null,
+  clearedBy: null,
+  snapshot: [],
+  site: 'default',
+  meta: null
+};
+
 function toSiteKey(value) {
   const site = typeof value === 'string' ? value.trim() : '';
   return site || 'default';
@@ -80,6 +93,163 @@ function forwardToBridge(site, message) {
   const target = bridgeConnections.get(site);
   if (!target) return false;
   return sendJson(target, { ...message, site });
+}
+
+function sanitizeActor(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    return { name: raw };
+  }
+  if (typeof raw === 'object') {
+    const actor = {
+      id: raw.id ?? raw.person_id ?? null,
+      name: raw.name ?? raw.actorName ?? null,
+      rank: raw.rank ?? raw.actorRank ?? null,
+      unit: raw.unit ?? raw.actorUnit ?? null
+    };
+    if (!actor.id && !actor.name && !actor.rank && !actor.unit) {
+      return null;
+    }
+    return actor;
+  }
+  return null;
+}
+
+function composeLockdownPayload(extra = {}) {
+  const base = {
+    active: !!lockdownState.active,
+    triggeredAt: lockdownState.triggeredAt,
+    triggeredBy: lockdownState.triggeredBy,
+    reason: lockdownState.reason,
+    message: lockdownState.message,
+    clearedAt: lockdownState.clearedAt,
+    clearedBy: lockdownState.clearedBy,
+    meta: lockdownState.meta || null
+  };
+  return { ...base, ...extra };
+}
+
+function broadcastLockdownStatus(extra = {}) {
+  const payload = { type: 'LOCKDOWN_STATUS', ...composeLockdownPayload(extra) };
+  uiConnections.forEach((ws, site) => {
+    sendJson(ws, { ...payload, site });
+  });
+}
+
+async function runWithTransaction(handler) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await handler(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function activateLockdown({ actor, reason, message } = {}) {
+  if (lockdownState.active) {
+    return composeLockdownPayload({ alreadyActive: true });
+  }
+
+  const actorInfo = sanitizeActor(actor);
+  const reasonText = reason || 'emergency_unlock';
+  const messageText = message || '긴급 개방 프로토콜 시행';
+  const triggeredAt = new Date().toISOString();
+
+  const snapshot = await runWithTransaction(async (client) => {
+    const { rows } = await client.query(`SELECT id, status FROM firearms ORDER BY id FOR UPDATE`);
+    if (rows.length) {
+      await client.query(`UPDATE firearms SET status='불출', last_change=now() WHERE status <> '불출'`);
+    }
+    return rows.map((row) => ({ id: row.id, status: row.status }));
+  });
+
+  lockdownState.active = true;
+  lockdownState.triggeredAt = triggeredAt;
+  lockdownState.triggeredBy = actorInfo;
+  lockdownState.reason = reasonText;
+  lockdownState.message = messageText;
+  lockdownState.clearedAt = null;
+  lockdownState.clearedBy = null;
+  lockdownState.snapshot = snapshot;
+  lockdownState.meta = { snapshotCount: snapshot.length };
+
+  const payload = composeLockdownPayload({ snapshotCount: snapshot.length });
+  broadcastLockdownStatus({ ...payload, active: true });
+
+  bridgeConnections.forEach((_, site) => {
+    forwardToBridge(site, {
+      type: 'LOCKDOWN_TRIGGER',
+      stage: 'emergency_manual',
+      reason: reasonText,
+      message: messageText,
+      actor: actorInfo || null
+    });
+  });
+
+  return payload;
+}
+
+async function restoreFirearms(snapshot = []) {
+  if (!Array.isArray(snapshot) || !snapshot.length) return;
+  const ids = snapshot.map((entry) => Number(entry.id));
+  const statuses = snapshot.map((entry) => String(entry.status || '불입'));
+  await runWithTransaction(async (client) => {
+    await client.query(
+      `UPDATE firearms AS f SET status = s.status, last_change = now()
+       FROM (SELECT UNNEST($1::int[]) AS id, UNNEST($2::text[]) AS status) AS s
+       WHERE f.id = s.id`,
+      [ids, statuses]
+    );
+  });
+}
+
+async function releaseLockdown({ actor, reason, message } = {}) {
+  if (!lockdownState.active) {
+    return composeLockdownPayload({ alreadyCleared: true });
+  }
+
+  const actorInfo = sanitizeActor(actor);
+  const reasonText = reason || 'unlock';
+  const messageText = message || '긴급 개방 해제';
+  const clearedAt = new Date().toISOString();
+  const snapshot = Array.isArray(lockdownState.snapshot) ? [...lockdownState.snapshot] : [];
+
+  if (snapshot.length) {
+    try {
+      await restoreFirearms(snapshot);
+    } catch (err) {
+      console.error('[lockdown] firearm restore failed:', err?.message || err);
+      throw err;
+    }
+  }
+
+  lockdownState.active = false;
+  lockdownState.clearedAt = clearedAt;
+  lockdownState.clearedBy = actorInfo;
+  lockdownState.reason = reasonText;
+  lockdownState.message = messageText;
+  lockdownState.snapshot = [];
+  lockdownState.meta = null;
+
+  const payload = composeLockdownPayload({ snapshotCount: snapshot.length });
+  broadcastLockdownStatus({ ...payload, active: false, cleared: true });
+
+  bridgeConnections.forEach((_, site) => {
+    forwardToBridge(site, {
+      type: 'LOCKDOWN_RELEASE',
+      reason: reasonText,
+      message: messageText,
+      actor: actorInfo || null
+    });
+  });
+
+  return payload;
 }
 
 async function buildFingerprintPayload(site, data) {
@@ -342,6 +512,45 @@ app.get('/health/db', async (req, res) => {
     `);
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: 'db health failed' }); }
+});
+
+app.get('/api/system/lockdown', (req, res) => {
+  const snapshotCount = Array.isArray(lockdownState.snapshot) ? lockdownState.snapshot.length : 0;
+  res.json(composeLockdownPayload({ snapshotCount }));
+});
+
+app.post('/api/system/lockdown/trigger', async (req, res) => {
+  try {
+    if (lockdownState.active) {
+      return res.status(409).json({ error: 'already_active', ...composeLockdownPayload() });
+    }
+    const state = await activateLockdown({
+      actor: req.body?.actor,
+      reason: req.body?.reason,
+      message: req.body?.message
+    });
+    res.json({ ok: true, ...state });
+  } catch (err) {
+    console.error('[lockdown] trigger failed:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'lockdown trigger failed' });
+  }
+});
+
+app.post('/api/system/lockdown/release', async (req, res) => {
+  try {
+    if (!lockdownState.active) {
+      return res.status(409).json({ error: 'not_active', ...composeLockdownPayload() });
+    }
+    const state = await releaseLockdown({
+      actor: req.body?.actor,
+      reason: req.body?.reason,
+      message: req.body?.message
+    });
+    res.json({ ok: true, ...state });
+  } catch (err) {
+    console.error('[lockdown] release failed:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'lockdown release failed' });
+  }
 });
 
 // === Login API (임시-평문비교) ===
